@@ -43,11 +43,20 @@ struct Script {
     stop_reason: Option<StopReason>,
     /// Override the exit code. Defaults to 0.
     exit_code: Option<i32>,
+    /// Token usage reported back in the [`AgentOutcome`]. Defaults to zero.
+    /// Used by the budget-overflow tests; the existing tests rely on the
+    /// default zero so the runner's budget check is a no-op.
+    tokens: Option<TokenUsage>,
 }
 
 impl Script {
     fn write(mut self, rel: impl Into<PathBuf>, bytes: impl Into<Vec<u8>>) -> Self {
         self.writes.push((rel.into(), bytes.into()));
+        self
+    }
+
+    fn tokens(mut self, tokens: TokenUsage) -> Self {
+        self.tokens = Some(tokens);
         self
     }
 }
@@ -103,7 +112,7 @@ impl Agent for ScriptedAgent {
         Ok(AgentOutcome {
             exit_code: script.exit_code.unwrap_or(0),
             stop_reason: script.stop_reason.unwrap_or(StopReason::Completed),
-            tokens: TokenUsage::default(),
+            tokens: script.tokens.unwrap_or_default(),
             log_path: req.log_path,
         })
     }
@@ -933,4 +942,197 @@ async fn audit_disabled_path_skips_auditor_entirely() {
     // attempts counter == 1 (implementer only).
     let state = foreman::state::load(dir.path()).unwrap().expect("state");
     assert_eq!(state.attempts.get(&pid("01")).copied(), Some(1));
+}
+
+/// Helper for the budget tests: builds a [`TokenUsage`] with the supplied
+/// top-level totals and an empty `by_role` map.
+///
+/// The runner re-keys the outcome under the dispatch's role when folding into
+/// [`RunState::token_usage`] (see `Runner::fold_token_usage`), so leaving
+/// `by_role` empty here avoids double-counting against the per-role bucket.
+fn tokens_total(input: u64, output: u64) -> TokenUsage {
+    TokenUsage {
+        input,
+        output,
+        by_role: Default::default(),
+    }
+}
+
+/// Phase 1 implementer reports tokens that exceed `max_total_tokens`. The
+/// next phase's budget check fires before any further dispatch and halts the
+/// run with `BudgetExceeded`.
+#[tokio::test]
+async fn token_budget_halts_run_before_next_phase_dispatch() {
+    let dir = make_workspace(THREE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+
+    let mut config = audit_disabled();
+    // Cap intentionally tiny: phase 1 will report 1500 tokens (1000 in + 500
+    // out) and trip the budget check at the start of phase 2.
+    config.budgets.max_total_tokens = Some(1000);
+
+    let agent = ScriptedAgent::new(vec![
+        Script::default()
+            .write("src/phase_01.rs", b"// phase 1\n")
+            .tokens(tokens_total(1000, 500)),
+        Script::default().write("src/phase_02.rs", b"// phase 2\n"),
+        Script::default().write("src/phase_03.rs", b"// phase 3\n"),
+    ]);
+
+    let (mut runner, _g) =
+        build_runner(dir.path(), THREE_PHASE_PLAN, EMPTY_DEFERRED, config, agent).await;
+
+    let summary = runner.run().await.unwrap();
+    match summary {
+        RunSummary::Halted { phase_id, reason } => {
+            assert_eq!(phase_id.as_str(), "02");
+            match reason {
+                HaltReason::BudgetExceeded(msg) => {
+                    assert!(msg.contains("token"), "msg: {msg}");
+                    assert!(msg.contains("1500"), "msg should report current usage: {msg}");
+                }
+                other => panic!("expected BudgetExceeded, got {other:?}"),
+            }
+        }
+        other => panic!("expected halt, got {other:?}"),
+    }
+
+    // Phase 1 commit landed, phases 2 and 3 didn't.
+    let log = git_log_oneline(dir.path());
+    let phase_commits: Vec<&String> = log
+        .iter()
+        .filter(|l| l.contains("[foreman] phase"))
+        .collect();
+    assert_eq!(
+        phase_commits.len(),
+        1,
+        "exactly one phase commit expected, got log:\n{log:?}"
+    );
+
+    // State reflects phase 1 completed and the implementer's per-role usage.
+    let state = foreman::state::load(dir.path()).unwrap().expect("state");
+    assert_eq!(
+        state.completed.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        vec!["01"]
+    );
+    let impl_usage = state.token_usage.by_role.get("implementer").unwrap();
+    assert_eq!(impl_usage.input, 1000);
+    assert_eq!(impl_usage.output, 500);
+    // Top-level totals match — implementer dispatched once.
+    assert_eq!(state.token_usage.input, 1000);
+    assert_eq!(state.token_usage.output, 500);
+    // Phase 2 was never dispatched, so its attempts entry stays empty.
+    assert!(!state.attempts.contains_key(&pid("02")));
+}
+
+/// USD budget enforcement: implementer reports tokens that, priced under the
+/// default opus rate, blow past `max_total_usd`. Halt fires before phase 2.
+#[tokio::test]
+async fn usd_budget_halts_when_priced_usage_exceeds_cap() {
+    let dir = make_workspace(THREE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+
+    let mut config = audit_disabled();
+    // Default opus pricing: 1M input × $15 + 1M output × $75 = $90.
+    // Cap of $50 is comfortably under that → halt fires before phase 2.
+    config.budgets.max_total_usd = Some(50.0);
+
+    let agent = ScriptedAgent::new(vec![
+        Script::default()
+            .write("src/phase_01.rs", b"// phase 1\n")
+            .tokens(tokens_total(1_000_000, 1_000_000)),
+        Script::default().write("src/phase_02.rs", b"// phase 2\n"),
+        Script::default().write("src/phase_03.rs", b"// phase 3\n"),
+    ]);
+
+    let (mut runner, _g) =
+        build_runner(dir.path(), THREE_PHASE_PLAN, EMPTY_DEFERRED, config, agent).await;
+
+    let summary = runner.run().await.unwrap();
+    match summary {
+        RunSummary::Halted { phase_id, reason } => {
+            assert_eq!(phase_id.as_str(), "02");
+            match reason {
+                HaltReason::BudgetExceeded(msg) => {
+                    assert!(msg.contains("USD"), "msg: {msg}");
+                }
+                other => panic!("expected BudgetExceeded, got {other:?}"),
+            }
+        }
+        other => panic!("expected halt, got {other:?}"),
+    }
+
+    // Per-role breakdown was preserved through the halt.
+    let state = foreman::state::load(dir.path()).unwrap().expect("state");
+    let impl_usage = state.token_usage.by_role.get("implementer").unwrap();
+    assert_eq!(impl_usage.input, 1_000_000);
+    assert_eq!(impl_usage.output, 1_000_000);
+}
+
+/// Token budget set on a fresh run is checked before the very first dispatch
+/// when prior usage already meets the cap (e.g., resumed from an earlier run
+/// that had recorded usage). Verifies the budget check guards every dispatch
+/// site, not just inter-phase transitions.
+#[tokio::test]
+async fn budget_check_fires_for_first_dispatch_when_usage_already_at_cap() {
+    let dir = make_workspace(ONE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+
+    let mut config = audit_disabled();
+    config.budgets.max_total_tokens = Some(100);
+
+    // Pre-seed RunState with usage that already meets the cap. The runner
+    // exposes `fresh_run_state` for the standard fresh-start case; we build a
+    // mutated state and persist it before constructing the Runner so the
+    // first dispatch has a tripped budget to react to.
+    use chrono::Utc;
+    use foreman::config::Config;
+    use foreman::deferred::DeferredDoc;
+    use foreman::plan;
+    use foreman::runner;
+    use foreman::state;
+
+    let plan_obj = plan::parse(ONE_PHASE_PLAN).unwrap();
+    let _ = DeferredDoc::empty();
+    let mut state_obj = runner::fresh_run_state(&plan_obj, &Config::default(), Utc::now());
+    // Pre-seed totals — by_role is irrelevant for the token-budget check,
+    // which compares the top-level `input + output` sum against the cap.
+    state_obj.token_usage = tokens_total(60, 50); // 110 ≥ 100
+    state::save(dir.path(), Some(&state_obj)).unwrap();
+
+    // Build runner with this state. We cannot reuse `build_runner` because it
+    // calls `fresh_run_state` itself; do it manually.
+    use foreman::git::{Git, ShellGit};
+    let git = ShellGit::new(dir.path());
+    git.create_branch(&state_obj.branch).await.unwrap();
+    git.checkout(&state_obj.branch).await.unwrap();
+
+    let agent = ScriptedAgent::new(vec![
+        Script::default().write("src/never.rs", b"// should not appear\n"),
+    ]);
+    let runner_git = ShellGit::new(dir.path());
+    let mut runner = foreman::runner::Runner::new(
+        dir.path().to_path_buf(),
+        config,
+        plan_obj,
+        DeferredDoc::empty(),
+        state_obj,
+        agent,
+        runner_git,
+    );
+
+    let summary = runner.run().await.unwrap();
+    match summary {
+        RunSummary::Halted { phase_id, reason } => {
+            assert_eq!(phase_id.as_str(), "01");
+            assert!(matches!(reason, HaltReason::BudgetExceeded(_)), "got {reason:?}");
+        }
+        other => panic!("expected halt, got {other:?}"),
+    }
+
+    // Implementer never dispatched, so the script's file isn't on disk and
+    // attempts is empty.
+    assert!(!dir.path().join("src/never.rs").exists());
+    let state = foreman::state::load(dir.path()).unwrap().expect("state");
+    assert!(state.attempts.is_empty());
 }

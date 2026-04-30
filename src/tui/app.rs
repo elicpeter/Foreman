@@ -411,6 +411,7 @@ fn format_halt(reason: &HaltReason) -> String {
         HaltReason::DeferredInvalid(_) => "deferred invalid".to_string(),
         HaltReason::TestsFailed(_) => "tests failed".to_string(),
         HaltReason::AgentFailure(_) => "agent failure".to_string(),
+        HaltReason::BudgetExceeded(_) => "budget exceeded".to_string(),
     }
 }
 

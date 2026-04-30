@@ -31,7 +31,7 @@ use crate::deferred::{self, DeferredDoc};
 use crate::git::{self, CommitId, Git};
 use crate::plan::{self, PhaseId, Plan, Snapshot};
 use crate::prompts;
-use crate::state::{self, RunState};
+use crate::state::{self, RunState, TokenUsage};
 use crate::tests as project_tests;
 use crate::util::write_atomic;
 
@@ -68,6 +68,10 @@ pub enum HaltReason {
     TestsFailed(String),
     /// The agent exited via timeout, cancellation, or an internal error.
     AgentFailure(String),
+    /// A configured budget was exhausted before the next agent dispatch
+    /// could fire. Carries a human-readable summary (`token budget exceeded:
+    /// 105000 >= cap 100000`, `USD budget exceeded: $5.0234 >= cap $5.0000`).
+    BudgetExceeded(String),
 }
 
 impl std::fmt::Display for HaltReason {
@@ -77,8 +81,44 @@ impl std::fmt::Display for HaltReason {
             HaltReason::DeferredInvalid(msg) => write!(f, "deferred.md is invalid: {msg}"),
             HaltReason::TestsFailed(summary) => write!(f, "tests failed: {summary}"),
             HaltReason::AgentFailure(msg) => write!(f, "agent failure: {msg}"),
+            HaltReason::BudgetExceeded(msg) => write!(f, "budget exceeded: {msg}"),
         }
     }
+}
+
+/// Compute `(total_tokens, total_usd)` for a [`TokenUsage`] under the supplied
+/// [`Config`].
+///
+/// `total_tokens` is the simple `input + output` sum from the top-level
+/// counter — that's the figure compared against
+/// [`crate::config::Budgets::max_total_tokens`].
+///
+/// `total_usd` walks each role in [`crate::config::ModelRoles`], looks up the
+/// per-role tokens in `usage.by_role`, and prices them against
+/// [`crate::config::Budgets::pricing`] keyed by the role's configured model
+/// id. Roles whose model is missing from the pricing table contribute zero —
+/// the token-count budget still applies. Agent-supplied `by_role` keys that
+/// don't match a configured role are ignored here, since we have no model
+/// assignment to price them under.
+pub fn budget_totals(config: &Config, usage: &TokenUsage) -> (u64, f64) {
+    let total_tokens = usage.input.saturating_add(usage.output);
+    let mut total_usd = 0.0;
+    let role_models: [(&str, &str); 4] = [
+        ("planner", config.models.planner.as_str()),
+        ("implementer", config.models.implementer.as_str()),
+        ("auditor", config.models.auditor.as_str()),
+        ("fixer", config.models.fixer.as_str()),
+    ];
+    for (role_key, model) in role_models {
+        let Some(role_usage) = usage.by_role.get(role_key) else {
+            continue;
+        };
+        let Some(price) = config.budgets.pricing.get(model) else {
+            continue;
+        };
+        total_usd += price.cost_usd(role_usage.input, role_usage.output);
+    }
+    (total_tokens, total_usd)
 }
 
 /// Streaming events the runner broadcasts to subscribers. Sends are
@@ -315,6 +355,10 @@ impl<A: Agent, G: Git> Runner<A, G> {
             })?;
         let phase_id = phase.id.clone();
 
+        if let Some(reason) = self.check_budget() {
+            return Ok(PhaseResult::Halted { phase_id, reason });
+        }
+
         let attempt = self.bump_attempts(&phase_id);
         let _ = self.events_tx.send(Event::PhaseStarted {
             phase_id: phase_id.clone(),
@@ -445,6 +489,30 @@ impl<A: Agent, G: Git> Runner<A, G> {
             next_phase,
             commit,
         })
+    }
+
+    /// Compare the running [`RunState::token_usage`] against the configured
+    /// budgets. Returns [`HaltReason::BudgetExceeded`] when either cap has
+    /// been met or surpassed, otherwise `None`. Called before every agent
+    /// dispatch so a fresh run never exceeds its budget by more than one
+    /// dispatch's worth of tokens.
+    fn check_budget(&self) -> Option<HaltReason> {
+        let (tokens, usd) = budget_totals(&self.config, &self.state.token_usage);
+        if let Some(cap) = self.config.budgets.max_total_tokens {
+            if tokens >= cap {
+                return Some(HaltReason::BudgetExceeded(format!(
+                    "token budget reached: {tokens} >= cap {cap}"
+                )));
+            }
+        }
+        if let Some(cap) = self.config.budgets.max_total_usd {
+            if usd >= cap {
+                return Some(HaltReason::BudgetExceeded(format!(
+                    "USD budget reached: ${usd:.4} >= cap ${cap:.4}"
+                )));
+            }
+        }
+        None
     }
 
     fn next_phase_id_after(&self, current: &PhaseId) -> Option<PhaseId> {
@@ -608,6 +676,9 @@ impl<A: Agent, G: Git> Runner<A, G> {
         let mut last_summary = initial_summary;
 
         for fixer_attempt in 1..=budget {
+            if let Some(reason) = self.check_budget() {
+                return Ok(FixerLoopResult::Halted(reason));
+            }
             let total_attempt = self.bump_attempts(&phase_id);
             let _ = self.events_tx.send(Event::FixerStarted {
                 phase_id: phase_id.clone(),
@@ -694,6 +765,10 @@ impl<A: Agent, G: Git> Runner<A, G> {
                 phase_id: phase_id.clone(),
             });
             return Ok(AuditPassResult::Continue);
+        }
+
+        if let Some(reason) = self.check_budget() {
+            return Ok(AuditPassResult::Halted(reason));
         }
 
         let total_attempt = self.bump_attempts(&phase_id);

@@ -15,6 +15,7 @@
 //! back to defaults, because a typo'd budget or model name should never be
 //! silently lost.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +30,11 @@ pub fn config_path(workspace: impl AsRef<Path>) -> PathBuf {
 
 /// Fully resolved foreman configuration. Every section has a [`Default`] so
 /// `Config::default()` is a valid runtime config.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally not derived because [`Budgets`] holds `f64` values
+/// (`max_total_usd`, pricing rates), and `f64` is only `PartialEq`. Compare
+/// with `==`/`assert_eq!` as usual.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Per-role model selection.
@@ -43,6 +48,9 @@ pub struct Config {
     /// Test runner overrides — by default the runner auto-detects from the
     /// project layout (see [`crate::tests::detect`]).
     pub tests: TestsConfig,
+    /// Cost-tracking limits and per-model pricing. When either limit is set,
+    /// the runner halts before the next agent dispatch that would exceed it.
+    pub budgets: Budgets,
 }
 
 /// Model identifiers used for each agent role. Strings are passed verbatim to
@@ -143,6 +151,84 @@ impl Default for GitConfig {
     }
 }
 
+/// Cost-tracking budgets and per-model pricing.
+///
+/// Either limit being [`Some`] activates budget enforcement: before every
+/// agent dispatch the runner totals [`crate::state::RunState::token_usage`]
+/// and halts with [`crate::runner::HaltReason::BudgetExceeded`] when usage
+/// already meets or exceeds the configured cap. Both limits can be set
+/// independently — the first to fire wins.
+///
+/// USD costs are computed from `pricing`: each role's accumulated tokens are
+/// multiplied by the per-model rate associated with that role's model in
+/// [`ModelRoles`]. Roles whose model is missing from `pricing` contribute zero
+/// USD (and a `tracing::warn` is emitted on the first dispatch); the `tokens`
+/// budget still applies. The default pricing table covers the Claude models
+/// foreman ships defaults for; `foreman.toml` may override or extend it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Budgets {
+    /// Hard cap on total tokens (input + output, summed across roles). `None`
+    /// disables the token-budget check.
+    pub max_total_tokens: Option<u64>,
+    /// Hard cap on total cost in USD computed from [`pricing`](Self::pricing).
+    /// `None` disables the USD-budget check.
+    pub max_total_usd: Option<f64>,
+    /// Per-model price points. Keyed by the same model identifier strings
+    /// used in [`ModelRoles`] (e.g., `"claude-opus-4-7"`).
+    pub pricing: HashMap<String, ModelPricing>,
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input_per_million_usd: 15.0,
+                output_per_million_usd: 75.0,
+            },
+        );
+        pricing.insert(
+            "claude-sonnet-4-6".to_string(),
+            ModelPricing {
+                input_per_million_usd: 3.0,
+                output_per_million_usd: 15.0,
+            },
+        );
+        pricing.insert(
+            "claude-haiku-4-5".to_string(),
+            ModelPricing {
+                input_per_million_usd: 1.0,
+                output_per_million_usd: 5.0,
+            },
+        );
+        Self {
+            max_total_tokens: None,
+            max_total_usd: None,
+            pricing,
+        }
+    }
+}
+
+/// Price points for a single model, in USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelPricing {
+    /// Cost in USD for one million input tokens.
+    pub input_per_million_usd: f64,
+    /// Cost in USD for one million output tokens.
+    pub output_per_million_usd: f64,
+}
+
+impl ModelPricing {
+    /// USD cost for the supplied input/output token counts at this rate.
+    pub fn cost_usd(&self, input: u64, output: u64) -> f64 {
+        let input = (input as f64) * self.input_per_million_usd / 1_000_000.0;
+        let output = (output as f64) * self.output_per_million_usd / 1_000_000.0;
+        input + output
+    }
+}
+
 /// Test-runner tunables. When `command` is `None` the runner auto-detects
 /// from the project layout (see [`crate::tests::detect`]); otherwise the
 /// configured command is used verbatim, bypassing detection entirely.
@@ -204,6 +290,10 @@ fn find_unknown_keys(value: &toml::Value) -> Vec<String> {
             "audit" => &["enabled", "small_fix_line_limit"],
             "git" => &["branch_prefix", "create_pr"],
             "tests" => &["command"],
+            // `budgets.pricing` is keyed by user-supplied model ids — we can't
+            // enumerate them up front, so we only validate the top-level keys
+            // here and accept any pricing entry shape via serde.
+            "budgets" => &["max_total_tokens", "max_total_usd", "pricing"],
             _ => {
                 out.push(section.clone());
                 continue;
@@ -239,6 +329,69 @@ mod tests {
         assert_eq!(cfg.git.branch_prefix, "foreman/run-");
         assert!(!cfg.git.create_pr);
         assert!(cfg.tests.command.is_none());
+        // Budget enforcement disabled by default; default pricing table covers
+        // the model id `[models]` defaults to so users can opt in by adding
+        // just `max_total_usd` without re-declaring rates.
+        assert_eq!(cfg.budgets.max_total_tokens, None);
+        assert_eq!(cfg.budgets.max_total_usd, None);
+        assert!(cfg.budgets.pricing.contains_key("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn model_pricing_cost_usd_is_per_million_tokens() {
+        let p = ModelPricing {
+            input_per_million_usd: 10.0,
+            output_per_million_usd: 100.0,
+        };
+        // 1M input tokens → $10. 100k output → $10. Total $20.
+        let cost = p.cost_usd(1_000_000, 100_000);
+        assert!((cost - 20.0).abs() < 1e-9, "cost: {cost}");
+    }
+
+    #[test]
+    fn budgets_section_parses_full_form() {
+        let text = "
+[budgets]
+max_total_tokens = 1_000_000
+max_total_usd = 5.0
+
+[budgets.pricing.claude-opus-4-7]
+input_per_million_usd = 12.5
+output_per_million_usd = 60.0
+
+[budgets.pricing.custom-model]
+input_per_million_usd = 0.5
+output_per_million_usd = 2.0
+";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.budgets.max_total_tokens, Some(1_000_000));
+        assert_eq!(cfg.budgets.max_total_usd, Some(5.0));
+        let opus = cfg.budgets.pricing.get("claude-opus-4-7").unwrap();
+        assert_eq!(opus.input_per_million_usd, 12.5);
+        assert_eq!(opus.output_per_million_usd, 60.0);
+        let custom = cfg.budgets.pricing.get("custom-model").unwrap();
+        assert_eq!(custom.input_per_million_usd, 0.5);
+    }
+
+    #[test]
+    fn budgets_pricing_subkeys_are_not_flagged_as_unknown() {
+        let text = "
+[budgets]
+max_total_tokens = 100
+
+[budgets.pricing.brand-new-model]
+input_per_million_usd = 1.0
+output_per_million_usd = 2.0
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let unknown = find_unknown_keys(&value);
+        // `pricing` itself is recognized; arbitrary model ids inside it are
+        // not validated and therefore not flagged.
+        assert!(
+            unknown.is_empty(),
+            "unexpected unknown keys: {:?}",
+            unknown
+        );
     }
 
     #[test]
