@@ -11,11 +11,9 @@
 //! stream-json --verbose --model haiku` from a shell — foreman invokes the
 //! binary with the same flag set.
 //!
-//! Foreman runs the agent under `--permission-mode bypassPermissions` because
-//! its whole point is unattended orchestration on a dedicated branch. If you
-//! want a different mode, construct the agent with
-//! [`ClaudeCodeAgent::with_permission_mode`] (or the builder will gain a
-//! config plumb in phase 6/12).
+//! Foreman runs the agent under `--permission-mode auto` for safe unattended
+//! orchestration. If you want a different mode, construct the agent with
+//! [`ClaudeCodeAgent::with_permission_mode`].
 //!
 //! ## Event mapping
 //!
@@ -72,7 +70,7 @@ impl ClaudeCodeAgent {
     pub fn new() -> Self {
         Self {
             binary: PathBuf::from(DEFAULT_BINARY),
-            permission_mode: "bypassPermissions".to_string(),
+            permission_mode: "auto".to_string(),
         }
     }
 
@@ -82,14 +80,13 @@ impl ClaudeCodeAgent {
     pub fn with_binary(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
-            permission_mode: "bypassPermissions".to_string(),
+            permission_mode: "auto".to_string(),
         }
     }
 
     /// Override the `--permission-mode` flag passed to `claude`. The default
-    /// (`bypassPermissions`) suits foreman's autonomous orchestration model;
-    /// other valid values per the CLI are `acceptEdits`, `auto`, `default`,
-    /// `dontAsk`, `plan`.
+    /// is `auto`; other valid values are `acceptEdits`, `bypassPermissions`,
+    /// `default`, `dontAsk`, `plan`.
     pub fn with_permission_mode(mut self, mode: impl Into<String>) -> Self {
         self.permission_mode = mode.into();
         self

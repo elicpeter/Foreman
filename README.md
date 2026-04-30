@@ -14,21 +14,9 @@
 
 Foreman is a Rust CLI that drives a coding agent (Claude Code today, others pluggable) through a multi-phase implementation plan. It runs your test suite after every phase, retries failures with a fixer agent, audits the diff, lands a commit, then moves on. Bounded retries everywhere. Token and dollar budgets. A live TUI if you want to watch.
 
-```text
-foreman  run 20260430T120000Z  branch foreman/run-20260430T120000Z
-phase 02 — Domain types   [implementer]
-────────────────────────────────────────────────────────────────────────────────────────
-┌ phases (1/3) ────────────────────────────────┐┌ agent output ────────────────────────┐
-│+ 01 Project foundation  (1x)                 ││Reading plan.md                       │
-│> 02 Domain types  (1x)                       ││Editing src/lib.rs                    │
-│· 03 Plan parser                              ││[tests passed] 12 passed              │
-│                                              ││[commit] phase 01: abc1234            │
-│                                              ││Defining PhaseId                      │
-│                                              ││                                      │
-│                                              ││                                      │
-└──────────────────────────────────────────────┘└──────────────────────────────────────┘
-q quit   p pause   a abort
-```
+<div align="center">
+  <img src="assets/foreman-tui.png" alt="foreman run --tui dashboard" width="900"/>
+</div>
 <sub align="center"><i>`foreman run --tui`. The dashboard. Phases on the left, live agent output on the right.</i></sub>
 
 ## Contents
