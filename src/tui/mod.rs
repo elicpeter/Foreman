@@ -15,7 +15,7 @@
 
 mod app;
 
-pub use app::{Activity, AgentDisplay, App, PhaseStatus, OUTPUT_BUFFER_LINES};
+pub use app::{Activity, AgentDisplay, App, PhaseStatus, UsageView, OUTPUT_BUFFER_LINES};
 
 use std::io;
 use std::time::Duration;
@@ -57,10 +57,11 @@ where
     let plan = runner.plan().clone();
     let state = runner.state().clone();
     let agent_display = build_agent_display(runner.config(), runner.agent().name());
+    let usage_view = build_usage_view(runner.config());
     let rx = runner.subscribe();
 
     let mut guard = TerminalGuard::setup().context("tui: setting up terminal")?;
-    let app = App::new(plan, state, agent_display);
+    let app = App::new(plan, state, agent_display, usage_view);
 
     let outcome = tokio::select! {
         biased;
@@ -110,6 +111,43 @@ fn build_agent_display(cfg: &Config, agent_name: &str) -> AgentDisplay {
         implementer_model: resolve(&cfg.models.implementer),
         fixer_model: resolve(&cfg.models.fixer),
         auditor_model: resolve(&cfg.models.auditor),
+    }
+}
+
+/// Build the [`UsageView`] the session-stats panel uses to price running
+/// token totals. The role/model mapping mirrors the precedence in
+/// [`build_agent_display`]: a `[agent.<backend>] model = "..."` override wins
+/// over `[models].<role>` so the panel costs each role against the same model
+/// the dispatcher actually sends.
+fn build_usage_view(cfg: &Config) -> UsageView {
+    let kind = cfg
+        .agent
+        .backend
+        .as_deref()
+        .and_then(|s| s.parse::<BackendKind>().ok())
+        .unwrap_or_default();
+    let overrides: &BackendOverrides = match kind {
+        BackendKind::ClaudeCode => &cfg.agent.claude_code,
+        BackendKind::Codex => &cfg.agent.codex,
+        BackendKind::Aider => &cfg.agent.aider,
+        BackendKind::Gemini => &cfg.agent.gemini,
+    };
+    let resolve = |role_default: &str| {
+        overrides
+            .model
+            .as_deref()
+            .unwrap_or(role_default)
+            .to_string()
+    };
+    let role_models = vec![
+        ("planner".to_string(), resolve(&cfg.models.planner)),
+        ("implementer".to_string(), resolve(&cfg.models.implementer)),
+        ("fixer".to_string(), resolve(&cfg.models.fixer)),
+        ("auditor".to_string(), resolve(&cfg.models.auditor)),
+    ];
+    UsageView {
+        role_models,
+        pricing: cfg.budgets.pricing.clone(),
     }
 }
 
@@ -289,7 +327,7 @@ mod tests {
             fixer_model: "claude-sonnet-4-6".into(),
             auditor_model: "claude-sonnet-4-6".into(),
         };
-        App::new(plan, state, agent_display)
+        App::new(plan, state, agent_display, UsageView::default())
     }
 
     #[test]

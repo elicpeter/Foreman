@@ -23,6 +23,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::grind::plan::{Hooks, PlanBudgets};
+
 /// Path of the workspace's configuration file (`<workspace>/pitboss.toml`).
 pub fn config_path(workspace: impl AsRef<Path>) -> PathBuf {
     workspace.as_ref().join("pitboss.toml")
@@ -58,6 +60,9 @@ pub struct Config {
     /// runner prepends a "talk like caveman" directive to every agent
     /// dispatch's system prompt to cut output tokens.
     pub caveman: CavemanConfig,
+    /// `pitboss grind` defaults. When a plan file leaves `[hooks]` /
+    /// `[budgets]` empty, the runner falls back to the values declared here.
+    pub grind: GrindConfig,
 }
 
 /// Model identifiers used for each agent role. Strings are passed verbatim to
@@ -319,6 +324,74 @@ pub enum CavemanIntensity {
     Ultra,
 }
 
+/// `[grind]` section — defaults that cover a `pitboss grind` run when no
+/// plan file overrides them.
+///
+/// `prompts_dir` corresponds to the `--prompts-dir` CLI flag's persistent
+/// counterpart and defaults to `None` (the standard project + global
+/// discovery rule lands in Phase 02). `default_plan` is the plan name to
+/// load when the user runs `pitboss grind` with no `--plan`. The remaining
+/// fields are the run-wide caps and inherited hook / budget tables that fall
+/// through to a plan that doesn't override them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GrindConfig {
+    /// Optional override for where to discover grind prompts. `None` keeps
+    /// the precedence chain (project, then global) from Phase 02.
+    pub prompts_dir: Option<PathBuf>,
+    /// Plan name to load when `pitboss grind` is invoked without `--plan`.
+    /// `None` means "synthesize the default rotation from discovered prompts".
+    pub default_plan: Option<String>,
+    /// Cap on concurrently-running sessions. Must be `>= 1`. Defaults to `1`
+    /// (sequential).
+    pub max_parallel: u32,
+    /// Number of consecutive failing sessions that trip the
+    /// consecutive-failure escape valve (Phase 08 exit code 5). Defaults to
+    /// `3`.
+    pub consecutive_failure_limit: u32,
+    /// What to do with per-session transcripts on the disk. Defaults to
+    /// [`TranscriptRetention::KeepAll`].
+    pub transcript_retention: TranscriptRetention,
+    /// Run-wide budgets. Mirrors the plan-level budgets so an unconfigured
+    /// plan still inherits these.
+    pub budgets: PlanBudgets,
+    /// Run-wide shell hooks. Mirrors the plan-level hooks so an unconfigured
+    /// plan still inherits these.
+    pub hooks: Hooks,
+}
+
+impl Default for GrindConfig {
+    fn default() -> Self {
+        Self {
+            prompts_dir: None,
+            default_plan: None,
+            max_parallel: 1,
+            consecutive_failure_limit: 3,
+            transcript_retention: TranscriptRetention::default(),
+            budgets: PlanBudgets::default(),
+            hooks: Hooks::default(),
+        }
+    }
+}
+
+/// Per-session transcript retention policy.
+///
+/// Phase 04 only ships the two end-points of the spectrum so an operator can
+/// either preserve every transcript for forensics or drop all of them after a
+/// session resolves. Intermediate variants (e.g., keep-last-N) can land in a
+/// later phase if needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRetention {
+    /// Keep every per-session transcript on disk indefinitely. Default.
+    #[default]
+    KeepAll,
+    /// Discard a session's transcript once the session resolves successfully.
+    /// Failed sessions' transcripts are kept regardless so post-mortems still
+    /// have something to look at.
+    KeepNone,
+}
+
 /// Per-backend overrides shared by every backend table.
 ///
 /// Every field is optional / additive — defaults match today's behavior
@@ -402,6 +475,20 @@ fn find_unknown_keys(value: &toml::Value) -> Vec<String> {
             // a config-schema bump.
             "agent" => &["backend", "claude_code", "codex", "aider", "gemini"],
             "caveman" => &["enabled", "intensity"],
+            // `grind.budgets` and `grind.hooks` are sub-tables. The walker
+            // only descends one level so unknown keys *inside* them are not
+            // flagged here — same tradeoff as `[agent.codex]`. Fields like
+            // `prompts_dir` and `default_plan` may themselves be sub-tables
+            // in future, so this is the right level to check.
+            "grind" => &[
+                "prompts_dir",
+                "default_plan",
+                "max_parallel",
+                "consecutive_failure_limit",
+                "transcript_retention",
+                "budgets",
+                "hooks",
+            ],
             _ => {
                 out.push(section.clone());
                 continue;
@@ -451,6 +538,14 @@ mod tests {
         // pre-feature pitboss.
         assert!(!cfg.caveman.enabled);
         assert_eq!(cfg.caveman.intensity, CavemanIntensity::Full);
+        // Grind config defaults; an unconfigured workspace runs sequentially
+        // with no plan-level overrides.
+        assert_eq!(cfg.grind, GrindConfig::default());
+        assert_eq!(cfg.grind.max_parallel, 1);
+        assert_eq!(cfg.grind.consecutive_failure_limit, 3);
+        assert_eq!(cfg.grind.transcript_retention, TranscriptRetention::KeepAll);
+        assert!(cfg.grind.prompts_dir.is_none());
+        assert!(cfg.grind.default_plan.is_none());
     }
 
     #[test]
@@ -836,5 +931,116 @@ command = \"cargo test\"
         crate::cli::init::run(dir.path()).unwrap();
         let cfg = load(dir.path()).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+}
+
+/// `[grind]` section parser tests, kept in their own `#[cfg(test)] mod grind`
+/// so they show up under `pitboss::config::grind::…` and can be filtered with
+/// `cargo test config::grind`.
+#[cfg(test)]
+mod grind {
+    use super::*;
+
+    #[test]
+    fn missing_section_yields_default() {
+        // A `pitboss.toml` with no `[grind]` block must round-trip to
+        // `GrindConfig::default()` so existing workspaces are untouched.
+        let cfg = parse("[git]\nbranch_prefix = \"x/\"\n").unwrap();
+        assert_eq!(cfg.grind, GrindConfig::default());
+    }
+
+    #[test]
+    fn full_section_round_trips() {
+        let text = r#"
+[grind]
+prompts_dir = "/var/pitboss/prompts"
+default_plan = "nightly"
+max_parallel = 4
+consecutive_failure_limit = 7
+transcript_retention = "keep_none"
+
+[grind.budgets]
+max_iterations = 50
+until = "2026-05-01T00:00:00Z"
+max_cost_usd = 5.0
+max_tokens = 1000000
+
+[grind.hooks]
+pre_session = "echo before"
+post_session = "echo after"
+on_failure = "echo failed"
+"#;
+        let cfg = parse(text).unwrap();
+        assert_eq!(
+            cfg.grind.prompts_dir,
+            Some(PathBuf::from("/var/pitboss/prompts"))
+        );
+        assert_eq!(cfg.grind.default_plan.as_deref(), Some("nightly"));
+        assert_eq!(cfg.grind.max_parallel, 4);
+        assert_eq!(cfg.grind.consecutive_failure_limit, 7);
+        assert_eq!(
+            cfg.grind.transcript_retention,
+            TranscriptRetention::KeepNone
+        );
+        assert_eq!(cfg.grind.budgets.max_iterations, Some(50));
+        assert_eq!(cfg.grind.budgets.max_cost_usd, Some(5.0));
+        assert_eq!(cfg.grind.budgets.max_tokens, Some(1_000_000));
+        assert!(cfg.grind.budgets.until.is_some());
+        assert_eq!(cfg.grind.hooks.pre_session.as_deref(), Some("echo before"));
+        assert_eq!(cfg.grind.hooks.post_session.as_deref(), Some("echo after"));
+        assert_eq!(cfg.grind.hooks.on_failure.as_deref(), Some("echo failed"));
+
+        // Canonical input must not trip the unknown-keys walker.
+        let value: toml::Value = toml::from_str(text).unwrap();
+        assert!(find_unknown_keys(&value).is_empty());
+    }
+
+    #[test]
+    fn partial_section_fills_missing_with_defaults() {
+        let text = r#"
+[grind]
+max_parallel = 2
+"#;
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.grind.max_parallel, 2);
+        // Other fields untouched.
+        assert_eq!(cfg.grind.consecutive_failure_limit, 3);
+        assert_eq!(cfg.grind.transcript_retention, TranscriptRetention::KeepAll);
+        assert!(cfg.grind.budgets.max_iterations.is_none());
+        assert!(cfg.grind.hooks.pre_session.is_none());
+    }
+
+    #[test]
+    fn transcript_retention_accepts_each_variant() {
+        for (s, expected) in [
+            ("keep_all", TranscriptRetention::KeepAll),
+            ("keep_none", TranscriptRetention::KeepNone),
+        ] {
+            let text = format!("[grind]\ntranscript_retention = \"{s}\"\n");
+            let cfg = parse(&text).unwrap();
+            assert_eq!(
+                cfg.grind.transcript_retention, expected,
+                "transcript_retention {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_retention_rejects_unknown_value() {
+        let text = "[grind]\ntranscript_retention = \"shred\"\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("expected schema"),
+            "expected schema error for unknown retention, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_grind_key_is_flagged() {
+        let text = "[grind]\nturbo = true\n";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let unknown = find_unknown_keys(&value);
+        assert!(unknown.contains(&"grind.turbo".to_string()));
     }
 }

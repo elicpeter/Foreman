@@ -10,15 +10,15 @@ agent claude-code  model claude-opus-4-7
 │· 01 Project foundation       ││[halt] phase 02: plan.md was modified by the  │
 │x 02 Domain types  (1x)       ││agent                                         │
 │· 03 Plan parser              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
-│                              ││                                              │
+└──────────────────────────────┘│                                              │
+┌ session ─────────────────────┐│                                              │
+│ elapsed   45s                ││                                              │
+│ cost      $0.00              ││                                              │
+│ tokens    0 / 0              ││                                              │
+│ dispatch  1                  ││                                              │
+│ by role                      ││                                              │
+│ impl 0/0 $0.00               ││                                              │
+│ fix  0/0 $0.00               ││                                              │
+│ aud  0/0 $0.00               ││                                              │
 └──────────────────────────────┘└──────────────────────────────────────────────┘
 q quit   p pause   a abort

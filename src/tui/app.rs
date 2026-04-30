@@ -9,19 +9,39 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::config::ModelPricing;
 use crate::plan::{PhaseId, Plan};
 use crate::runner::{Event, HaltReason};
-use crate::state::RunState;
+use crate::state::{RunState, TokenUsage};
 
 /// Cap on the agent output buffer. Old lines are dropped once the cap is
 /// reached so the dashboard cannot grow unbounded across a long run.
 pub const OUTPUT_BUFFER_LINES: usize = 1000;
+
+/// Height of the session-stats panel under the phase list. Sized to fit a
+/// fixed eight content lines (elapsed / cost / tokens / dispatches plus a
+/// `by role` heading and three role rows) inside its border.
+const STATS_HEIGHT: u16 = 10;
+
+/// Slice of [`crate::config::Config`] needed to price running token usage in
+/// the session-stats panel. Built by [`crate::tui::run`] from the runner's
+/// config so the App doesn't take a dependency on the full `Config` shape.
+#[derive(Debug, Clone, Default)]
+pub struct UsageView {
+    /// Role name -> model id (mirrors [`crate::config::ModelRoles`]). Used
+    /// to look up `pricing` when totaling cost.
+    pub role_models: Vec<(String, String)>,
+    /// Per-model price points, keyed by model id (clone of
+    /// [`crate::config::Budgets::pricing`]).
+    pub pricing: HashMap<String, ModelPricing>,
+}
 
 /// Static header chip describing the active agent backend and the per-role
 /// model it dispatches with. The runner can mix models across roles when a
@@ -112,6 +132,18 @@ pub struct App {
     /// for the run; the rendered value tracks `activity` to show the model
     /// the currently dispatched role is using.
     agent_display: AgentDisplay,
+    /// Pricing + role/model mapping used by the session-stats panel.
+    usage_view: UsageView,
+    /// Running token totals, replaced wholesale on each [`Event::UsageUpdated`].
+    token_usage: TokenUsage,
+    /// When this run was first started — used to compute elapsed time in the
+    /// stats panel. Captured from [`RunState::started_at`] at construction.
+    started_at: DateTime<Utc>,
+    /// Optional override for the "now" timestamp in the stats panel. `None`
+    /// in production (we just call [`Utc::now`]); set in tests to make the
+    /// snapshot deterministic since the elapsed display would otherwise drift
+    /// across runs.
+    now_override: Option<DateTime<Utc>>,
     output: VecDeque<String>,
     /// User toggled "pause output" — UI-side only; new agent lines are
     /// dropped while paused so the user can read what is on screen without
@@ -126,8 +158,14 @@ impl App {
     /// Build a fresh `App` from the snapshot the host runner is about to
     /// drive. `plan` is held as-is (it serves as the static phase list);
     /// `state` seeds the run-level header fields; `agent_display` populates
-    /// the static agent / per-role model chip in the header.
-    pub fn new(plan: Plan, state: RunState, agent_display: AgentDisplay) -> Self {
+    /// the static agent / per-role model chip in the header; `usage_view`
+    /// supplies the pricing table the session-stats panel uses.
+    pub fn new(
+        plan: Plan,
+        state: RunState,
+        agent_display: AgentDisplay,
+        usage_view: UsageView,
+    ) -> Self {
         let mut phase_status = HashMap::new();
         for phase in &plan.phases {
             phase_status.insert(phase.id.clone(), PhaseStatus::Pending);
@@ -144,6 +182,10 @@ impl App {
             attempts: state.attempts.clone(),
             activity: Activity::Idle,
             agent_display,
+            usage_view,
+            token_usage: state.token_usage.clone(),
+            started_at: state.started_at,
+            now_override: None,
             output: VecDeque::with_capacity(OUTPUT_BUFFER_LINES),
             paused: false,
             quit_requested: false,
@@ -165,6 +207,14 @@ impl App {
     /// Mark quit. Idempotent.
     pub fn request_quit(&mut self) {
         self.quit_requested = true;
+    }
+
+    /// Override the "now" timestamp the stats panel reads for elapsed time.
+    /// Test-only — production calls [`Utc::now`] directly so the panel ticks
+    /// with the wall clock.
+    #[cfg(test)]
+    pub fn set_now(&mut self, now: DateTime<Utc>) {
+        self.now_override = Some(now);
     }
 
     /// Toggle the "pause output stream" flag. While paused, agent stdout /
@@ -261,6 +311,9 @@ impl App {
             }
             Event::RunFinished => {
                 self.activity = Activity::Done;
+            }
+            Event::UsageUpdated(usage) => {
+                self.token_usage = usage;
             }
         }
     }
@@ -368,7 +421,19 @@ impl App {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(area);
-        self.render_phases(frame, cols[0]);
+        // Drop the stats panel on terminals too short to fit it without
+        // squeezing the phase list to nothing — the panel needs `STATS_HEIGHT`
+        // rows plus a couple for the phase list to remain useful.
+        if cols[0].height >= STATS_HEIGHT + 4 {
+            let left = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(STATS_HEIGHT)])
+                .split(cols[0]);
+            self.render_phases(frame, left[0]);
+            self.render_stats(frame, left[1]);
+        } else {
+            self.render_phases(frame, cols[0]);
+        }
         self.render_output(frame, cols[1]);
     }
 
@@ -444,6 +509,94 @@ impl App {
             ));
         let list = List::new(items).block(block);
         frame.render_widget(list, area);
+    }
+
+    fn render_stats(&self, frame: &mut Frame, area: Rect) {
+        let label = Style::default().fg(Color::Gray);
+        let value = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+
+        let now = self.now_override.unwrap_or_else(Utc::now);
+        let elapsed = format_elapsed(now - self.started_at);
+        let total_in = self.token_usage.input;
+        let total_out = self.token_usage.output;
+        let total_usd = self.total_usd();
+        let dispatches: u32 = self.attempts.values().copied().sum();
+
+        let mut lines: Vec<Line> = Vec::with_capacity(8);
+        lines.push(Line::from(vec![
+            Span::styled(" elapsed   ", label),
+            Span::styled(elapsed, Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" cost      ", label),
+            Span::styled(
+                format_usd(total_usd),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" tokens    ", label),
+            Span::styled(format_tokens(total_in), value),
+            Span::styled(" / ", dim),
+            Span::styled(format_tokens(total_out), value),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" dispatch  ", label),
+            Span::styled(dispatches.to_string(), value),
+        ]));
+        lines.push(Line::from(Span::styled(" by role", dim)));
+
+        for role in ["implementer", "fixer", "auditor"] {
+            let usage = self.token_usage.by_role.get(role);
+            let (rin, rout) = usage.map(|u| (u.input, u.output)).unwrap_or((0, 0));
+            let role_usd = self.role_usd(role, rin, rout);
+            let role_color = role_color(role);
+            let short = role_short(role);
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{short:<4}"), Style::default().fg(role_color)),
+                Span::raw(" "),
+                Span::styled(format_tokens(rin), value),
+                Span::styled("/", dim),
+                Span::styled(format_tokens(rout), value),
+                Span::raw(" "),
+                Span::styled(format_usd(role_usd), Style::default().fg(Color::Green)),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(" session ", label));
+        let para = Paragraph::new(lines).block(block);
+        frame.render_widget(para, area);
+    }
+
+    fn role_usd(&self, role: &str, input: u64, output: u64) -> f64 {
+        let Some((_, model)) = self.usage_view.role_models.iter().find(|(r, _)| r == role) else {
+            return 0.0;
+        };
+        let Some(price) = self.usage_view.pricing.get(model) else {
+            return 0.0;
+        };
+        price.cost_usd(input, output)
+    }
+
+    fn total_usd(&self) -> f64 {
+        let mut total = 0.0;
+        for (role, model) in &self.usage_view.role_models {
+            let Some(usage) = self.token_usage.by_role.get(role) else {
+                continue;
+            };
+            let Some(price) = self.usage_view.pricing.get(model) else {
+                continue;
+            };
+            total += price.cost_usd(usage.input, usage.output);
+        }
+        total
     }
 
     fn render_output(&self, frame: &mut Frame, area: Rect) {
@@ -574,6 +727,62 @@ fn activity_color(a: &Activity) -> Color {
     }
 }
 
+fn format_elapsed(d: chrono::Duration) -> String {
+    let total = d.num_seconds().max(0);
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_usd(usd: f64) -> String {
+    if usd <= 0.0 {
+        "$0.00".to_string()
+    } else if usd < 0.01 {
+        "<$0.01".to_string()
+    } else if usd < 100.0 {
+        format!("${:.2}", usd)
+    } else {
+        format!("${:.0}", usd)
+    }
+}
+
+fn role_short(role: &str) -> &'static str {
+    match role {
+        "implementer" => "impl",
+        "fixer" => "fix",
+        "auditor" => "aud",
+        "planner" => "plan",
+        _ => "role",
+    }
+}
+
+fn role_color(role: &str) -> Color {
+    match role {
+        "implementer" => Color::Cyan,
+        "fixer" => Color::Yellow,
+        "auditor" => Color::Blue,
+        "planner" => Color::Magenta,
+        _ => Color::Gray,
+    }
+}
+
 fn format_halt(reason: &HaltReason) -> String {
     match reason {
         HaltReason::PlanTampered => "plan tampered".to_string(),
@@ -628,12 +837,54 @@ mod tests {
         )
     }
 
+    fn fixed_started_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-04-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Snapshot-friendly `RunState` with a fixed `started_at`. Without this
+    /// the wall-clock-driven `started_at` from [`RunState::new`] would make
+    /// the elapsed-time line in the stats panel non-deterministic.
+    fn fresh_state_at(started_at: DateTime<Utc>) -> RunState {
+        let mut s = fresh_state();
+        s.started_at = started_at;
+        s
+    }
+
     fn fixture_agent() -> AgentDisplay {
         AgentDisplay {
             agent_name: "claude-code".into(),
             implementer_model: "claude-opus-4-7".into(),
             fixer_model: "claude-sonnet-4-6".into(),
             auditor_model: "claude-sonnet-4-6".into(),
+        }
+    }
+
+    fn fixture_usage_view() -> UsageView {
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input_per_million_usd: 15.0,
+                output_per_million_usd: 75.0,
+            },
+        );
+        pricing.insert(
+            "claude-sonnet-4-6".to_string(),
+            ModelPricing {
+                input_per_million_usd: 3.0,
+                output_per_million_usd: 15.0,
+            },
+        );
+        UsageView {
+            role_models: vec![
+                ("planner".into(), "claude-opus-4-7".into()),
+                ("implementer".into(), "claude-opus-4-7".into()),
+                ("fixer".into(), "claude-sonnet-4-6".into()),
+                ("auditor".into(), "claude-sonnet-4-6".into()),
+            ],
+            pricing,
         }
     }
 
@@ -658,7 +909,12 @@ mod tests {
 
     #[test]
     fn handle_phase_started_marks_phase_running_and_sets_activity() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         app.handle_event(Event::PhaseStarted {
             phase_id: pid("01"),
             title: "Project foundation".into(),
@@ -671,7 +927,12 @@ mod tests {
 
     #[test]
     fn fixer_started_sets_activity_with_attempt_index() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         app.handle_event(Event::FixerStarted {
             phase_id: pid("01"),
             fixer_attempt: 2,
@@ -683,7 +944,12 @@ mod tests {
 
     #[test]
     fn phase_committed_moves_phase_to_completed() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         app.handle_event(Event::PhaseStarted {
             phase_id: pid("01"),
             title: "Project foundation".into(),
@@ -699,7 +965,12 @@ mod tests {
 
     #[test]
     fn phase_halted_marks_failure_and_sets_halted_activity() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         app.handle_event(Event::PhaseHalted {
             phase_id: pid("02"),
             reason: HaltReason::TestsFailed("boom".into()),
@@ -713,7 +984,12 @@ mod tests {
 
     #[test]
     fn agent_output_is_appended_until_paused() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         app.handle_event(Event::AgentStdout("first line".into()));
         app.handle_event(Event::AgentStdout("second".into()));
         let lines: Vec<&String> = app.output_lines().collect();
@@ -735,7 +1011,12 @@ mod tests {
         // The header's `model <id>` chip must follow the dispatched role so a
         // mixed-model run (e.g., Opus implementer + Sonnet auditor) shows the
         // truthful identifier at every moment of the dispatch loop.
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         // Idle / pre-dispatch falls back to the implementer's model.
         assert_eq!(app.current_model(), "claude-opus-4-7");
 
@@ -766,7 +1047,12 @@ mod tests {
 
     #[test]
     fn output_buffer_drops_oldest_when_full() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+        );
         for i in 0..(OUTPUT_BUFFER_LINES + 5) {
             app.handle_event(Event::AgentStdout(format!("line {i}")));
         }
@@ -778,14 +1064,29 @@ mod tests {
 
     #[test]
     fn render_initial_layout_80x20() {
-        let app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let started_at = fixed_started_at();
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state_at(started_at),
+            fixture_agent(),
+            fixture_usage_view(),
+        );
+        app.set_now(started_at);
         let snap = render_to_string(&app, 80, 20);
         insta::assert_snapshot!("initial_80x20", snap);
     }
 
     #[test]
     fn render_mid_run_with_output_120x30() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let started_at = fixed_started_at();
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state_at(started_at),
+            fixture_agent(),
+            fixture_usage_view(),
+        );
+        // 2 minutes 14 seconds into the run.
+        app.set_now(started_at + chrono::Duration::seconds(134));
         app.handle_event(Event::PhaseStarted {
             phase_id: pid("01"),
             title: "Project foundation".into(),
@@ -808,6 +1109,33 @@ mod tests {
             attempt: 1,
         });
         app.handle_event(Event::AgentStdout("Defining PhaseId".into()));
+        let mut usage = TokenUsage {
+            input: 32_000 + 8_000 + 5_200,
+            output: 5_200 + 1_900 + 1_000,
+            ..Default::default()
+        };
+        usage.by_role.insert(
+            "implementer".into(),
+            crate::state::RoleUsage {
+                input: 32_000,
+                output: 5_200,
+            },
+        );
+        usage.by_role.insert(
+            "fixer".into(),
+            crate::state::RoleUsage {
+                input: 8_000,
+                output: 1_900,
+            },
+        );
+        usage.by_role.insert(
+            "auditor".into(),
+            crate::state::RoleUsage {
+                input: 5_200,
+                output: 1_000,
+            },
+        );
+        app.handle_event(Event::UsageUpdated(usage));
 
         let snap = render_to_string(&app, 120, 30);
         insta::assert_snapshot!("mid_run_120x30", snap);
@@ -815,7 +1143,14 @@ mod tests {
 
     #[test]
     fn render_halted_state_80x20() {
-        let mut app = App::new(three_phase_plan(), fresh_state(), fixture_agent());
+        let started_at = fixed_started_at();
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state_at(started_at),
+            fixture_agent(),
+            fixture_usage_view(),
+        );
+        app.set_now(started_at + chrono::Duration::seconds(45));
         app.handle_event(Event::PhaseStarted {
             phase_id: pid("02"),
             title: "Domain types".into(),
@@ -827,5 +1162,52 @@ mod tests {
         });
         let snap = render_to_string(&app, 80, 20);
         insta::assert_snapshot!("halted_80x20", snap);
+    }
+
+    #[test]
+    fn usage_updated_replaces_running_totals() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            fixture_usage_view(),
+        );
+        assert_eq!(app.token_usage.input, 0);
+        let mut usage = TokenUsage {
+            input: 1_234,
+            output: 56,
+            ..Default::default()
+        };
+        usage.by_role.insert(
+            "implementer".into(),
+            crate::state::RoleUsage {
+                input: 1_234,
+                output: 56,
+            },
+        );
+        app.handle_event(Event::UsageUpdated(usage));
+        assert_eq!(app.token_usage.input, 1_234);
+        assert_eq!(app.token_usage.output, 56);
+        let usd = app.total_usd();
+        // 1234 input @ $15/M = 0.01851; 56 output @ $75/M = 0.0042; total ~0.02271.
+        assert!((usd - 0.022_71).abs() < 1e-4, "got {usd}");
+    }
+
+    #[test]
+    fn formatters_round_trip_token_and_usd_buckets() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_500), "1.5k");
+        assert_eq!(format_tokens(1_234_000), "1.23M");
+
+        assert_eq!(format_usd(0.0), "$0.00");
+        assert_eq!(format_usd(0.001), "<$0.01");
+        assert_eq!(format_usd(0.43), "$0.43");
+        assert_eq!(format_usd(123.4), "$123");
+
+        assert_eq!(format_elapsed(chrono::Duration::seconds(0)), "0s");
+        assert_eq!(format_elapsed(chrono::Duration::seconds(45)), "45s");
+        assert_eq!(format_elapsed(chrono::Duration::seconds(125)), "2m 05s");
+        assert_eq!(format_elapsed(chrono::Duration::seconds(3_725)), "1h 02m");
     }
 }

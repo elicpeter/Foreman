@@ -150,11 +150,14 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use std::collections::HashMap;
+
+use pitboss::config::ModelPricing;
 use pitboss::git::CommitId;
 use pitboss::plan::{Phase, PhaseId, Plan};
 use pitboss::runner::{Event, HaltReason};
 use pitboss::state::RunState;
-use pitboss::tui::{App, AgentDisplay};
+use pitboss::tui::{AgentDisplay, App, UsageView};
 
 fn pid(s: &str) -> PhaseId {
     PhaseId::parse(s).unwrap()
@@ -200,8 +203,35 @@ fn demo_agent() -> AgentDisplay {
     }
 }
 
+fn demo_usage_view() -> UsageView {
+    let mut pricing = HashMap::new();
+    pricing.insert(
+        "claude-opus-4-7".to_string(),
+        ModelPricing {
+            input_per_million_usd: 15.0,
+            output_per_million_usd: 75.0,
+        },
+    );
+    pricing.insert(
+        "claude-sonnet-4-6".to_string(),
+        ModelPricing {
+            input_per_million_usd: 3.0,
+            output_per_million_usd: 15.0,
+        },
+    );
+    UsageView {
+        role_models: vec![
+            ("planner".into(), "claude-opus-4-7".into()),
+            ("implementer".into(), "claude-opus-4-7".into()),
+            ("fixer".into(), "claude-sonnet-4-6".into()),
+            ("auditor".into(), "claude-sonnet-4-6".into()),
+        ],
+        pricing,
+    }
+}
+
 fn build_tui() -> App {
-    let mut app = App::new(three_phase_plan(), fresh_state(), demo_agent());
+    let mut app = App::new(three_phase_plan(), fresh_state(), demo_agent(), demo_usage_view());
     app.handle_event(Event::PhaseStarted {
         phase_id: pid("01"),
         title: "Project foundation".into(),
@@ -232,7 +262,7 @@ fn build_tui() -> App {
 }
 
 fn build_halt() -> App {
-    let mut app = App::new(three_phase_plan(), fresh_state(), demo_agent());
+    let mut app = App::new(three_phase_plan(), fresh_state(), demo_agent(), demo_usage_view());
     app.handle_event(Event::PhaseStarted {
         phase_id: pid("02"),
         title: "Domain types".into(),

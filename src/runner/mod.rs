@@ -201,6 +201,11 @@ pub enum Event {
     },
     /// The runner advanced past the final phase. No further phases remain.
     RunFinished,
+    /// Aggregated token usage was updated after an agent dispatch finished.
+    /// Carries a snapshot of [`crate::state::RunState::token_usage`] so
+    /// subscribers can show running cost / token totals without needing a
+    /// reference to the runner state.
+    UsageUpdated(crate::state::TokenUsage),
 }
 
 /// Outcome of [`Runner::run_phase`].
@@ -885,6 +890,9 @@ impl<A: Agent, G: Git> Runner<A, G> {
             e.input += v.input;
             e.output += v.output;
         }
+        let _ = self
+            .events_tx
+            .send(Event::UsageUpdated(self.state.token_usage.clone()));
     }
 
     fn restore_deferred(
@@ -1181,6 +1189,10 @@ fn log_event_line(event: &Event) {
             if c {
                 eprintln!("{rule}");
             }
+        }
+        Event::UsageUpdated(_) => {
+            // Snapshot consumed by the TUI; the plain logger doesn't surface
+            // running token totals to keep stderr clean.
         }
     }
 }
