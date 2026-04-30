@@ -190,6 +190,11 @@ create_pr     = false            # equivalent to `pitboss run --pr`
 # [budgets.pricing.claude-opus-4-7]
 # input_per_million_usd  = 15.0
 # output_per_million_usd = 75.0
+
+# Caveman mode. Off by default. See "Caveman mode" below.
+[caveman]
+enabled   = false
+intensity = "full"   # one of: lite, full, ultra
 ```
 
 ### Per-role model recommendations
@@ -205,19 +210,11 @@ The defaults set every role to the latest Opus, which is fine if you don't want 
 
 Configure pricing for any model you reference in `[models]` so `pitboss status` and the USD budget check produce accurate numbers.
 
-## Caveman mode
+### Caveman mode
 
 Pitboss can prepend a "talk like caveman" directive to every agent system prompt to cut output tokens. The idea comes from the [caveman skill](https://github.com/JuliusBrussee/caveman): drop articles, filler words, and pleasantries while keeping technical content exact. Output drops by roughly 65 to 75 percent on prose. Code blocks, commit messages, PR descriptions, and the structured `plan.md` and `deferred.md` artifacts stay in their normal format so downstream parsing is not affected.
 
-Off by default. Turn it on per workspace:
-
-```toml
-[caveman]
-enabled   = true
-intensity = "full"   # one of: lite, full, ultra
-```
-
-Three intensity levels:
+Off by default. Flip `enabled = true` in the `[caveman]` block above to turn it on. Three intensity levels:
 
 | Level   | What it does                                                                       |
 | ------- | ---------------------------------------------------------------------------------- |
