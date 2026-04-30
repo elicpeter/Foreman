@@ -1,6 +1,6 @@
-//! `plan.md` domain types.
+//! `plan.md` domain types and (de)serialization.
 //!
-//! Phase 2 introduces the type vocabulary; phase 3 adds parsing, serialization,
+//! Phase 2 introduced the type vocabulary; phase 3 adds parsing, serialization,
 //! and snapshot/verify utilities on top.
 
 use std::cmp::Ordering;
@@ -8,6 +8,12 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod parse;
+mod snapshot;
+
+pub use parse::{parse, serialize, PlanParseError};
+pub use snapshot::{snapshot, verify_unchanged, Snapshot, SnapshotError};
 
 /// A phase identifier such as `"02"` or `"10b"`.
 ///
@@ -130,23 +136,40 @@ pub struct Phase {
     pub body: String,
 }
 
-/// Parsed `plan.md`: the current phase pointer plus all phase blocks.
+/// Parsed `plan.md`: the current phase pointer, raw frontmatter and preamble,
+/// plus all phase blocks.
 ///
-/// `phases` is held in `PhaseId` order; use [`Plan::new`] to enforce the sort.
+/// Frontmatter and preamble are kept as raw text so [`serialize`] can reproduce
+/// the input byte-for-byte. `phases` is held in `PhaseId` order; use
+/// [`Plan::new`] to enforce the sort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
-    /// The phase the runner is currently working on.
+    /// The phase the runner is currently working on. Mirrors the
+    /// `current_phase` key inside [`Plan::frontmatter`].
     pub current_phase: PhaseId,
+    /// Raw YAML frontmatter text — the bytes between the opening and closing
+    /// `---` fences, with no surrounding markers and no trailing newline.
+    #[serde(default)]
+    pub frontmatter: String,
+    /// Raw markdown text between the closing `---` of the frontmatter and the
+    /// first `# Phase NN:` heading. Preserved verbatim, including the leading
+    /// newline immediately after the closing fence.
+    #[serde(default)]
+    pub preamble: String,
     /// All phases, sorted by `PhaseId`.
     pub phases: Vec<Phase>,
 }
 
 impl Plan {
-    /// Build a new `Plan`, sorting `phases` by `PhaseId`.
+    /// Build a new `Plan`, sorting `phases` by `PhaseId` and seeding a minimal
+    /// frontmatter that names the current phase. The preamble is empty.
     pub fn new(current_phase: PhaseId, mut phases: Vec<Phase>) -> Self {
         phases.sort_by(|a, b| a.id.cmp(&b.id));
+        let frontmatter = format!("current_phase: \"{}\"", current_phase);
         Plan {
             current_phase,
+            frontmatter,
+            preamble: String::new(),
             phases,
         }
     }
@@ -155,6 +178,45 @@ impl Plan {
     pub fn phase(&self, id: &PhaseId) -> Option<&Phase> {
         self.phases.iter().find(|p| &p.id == id)
     }
+
+    /// Update [`Plan::current_phase`] and rewrite the matching key in the raw
+    /// frontmatter. The only mutator the runner uses on `plan.md`.
+    ///
+    /// The line is rewritten in canonical form (`current_phase: "<id>"`); any
+    /// custom quoting style on the original line is replaced. If the
+    /// frontmatter contained no `current_phase:` line (e.g., for a `Plan`
+    /// constructed by hand without it), the key is appended on a new line.
+    pub fn set_current_phase(&mut self, id: PhaseId) {
+        let mut out = String::with_capacity(self.frontmatter.len() + 16);
+        let mut replaced = false;
+        for segment in self.frontmatter.split_inclusive('\n') {
+            let (content, eol) = match segment.strip_suffix('\n') {
+                Some(c) => (c, "\n"),
+                None => (segment, ""),
+            };
+            if !replaced && is_current_phase_key(content) {
+                out.push_str(&format!("current_phase: \"{}\"{}", id, eol));
+                replaced = true;
+            } else {
+                out.push_str(segment);
+            }
+        }
+        if !replaced {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("current_phase: \"{}\"", id));
+        }
+        self.frontmatter = out;
+        self.current_phase = id;
+    }
+}
+
+fn is_current_phase_key(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("current_phase")
+        .is_some_and(|rest| rest.trim_start().starts_with(':'))
 }
 
 #[cfg(test)]
