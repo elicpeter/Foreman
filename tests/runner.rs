@@ -944,6 +944,69 @@ async fn audit_disabled_path_skips_auditor_entirely() {
     assert_eq!(state.attempts.get(&pid("01")).copied(), Some(1));
 }
 
+/// Regression test: `runner::log_events` must return after the runner emits
+/// its terminal event, even though the runner keeps holding the broadcast
+/// `Sender` (it's needed for post-run lookups like PR creation). Before this
+/// was wired up, `foreman run --dry-run` would advance through every phase,
+/// print "[foreman] run finished", and then hang the process forever waiting
+/// on the logger task.
+#[tokio::test]
+async fn log_events_returns_after_run_finished_even_with_runner_alive() {
+    let dir = make_workspace(THREE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+
+    let agent = ScriptedAgent::new(vec![
+        Script::default().write("src/p1.rs", b"// 1\n"),
+        Script::default().write("src/p2.rs", b"// 2\n"),
+        Script::default().write("src/p3.rs", b"// 3\n"),
+    ]);
+
+    let (mut runner, _g) =
+        build_runner(dir.path(), THREE_PHASE_PLAN, EMPTY_DEFERRED, audit_disabled(), agent).await;
+
+    let rx = runner.subscribe();
+    let logger = tokio::spawn(foreman::runner::log_events(rx));
+
+    let summary = runner.run().await.unwrap();
+    assert!(matches!(summary, RunSummary::Finished));
+
+    // The runner is still in scope (so the broadcast Sender is alive); the
+    // logger must still return because RunFinished was broadcast.
+    tokio::time::timeout(std::time::Duration::from_secs(2), logger)
+        .await
+        .expect("log_events must return within 2s of RunFinished")
+        .expect("logger task panicked");
+}
+
+/// Halt-side counterpart: `log_events` must also exit when the runner halts,
+/// because `Runner::run()` broadcasts `Event::PhaseHalted` parallel to the
+/// success-side `RunFinished`.
+#[tokio::test]
+async fn log_events_returns_after_phase_halted_even_with_runner_alive() {
+    let dir = make_workspace(ONE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+
+    let agent = ScriptedAgent::new(vec![Script {
+        stop_reason: Some(StopReason::Error("synthetic halt".into())),
+        exit_code: Some(2),
+        ..Script::default()
+    }]);
+
+    let (mut runner, _g) =
+        build_runner(dir.path(), ONE_PHASE_PLAN, EMPTY_DEFERRED, audit_disabled(), agent).await;
+
+    let rx = runner.subscribe();
+    let logger = tokio::spawn(foreman::runner::log_events(rx));
+
+    let summary = runner.run().await.unwrap();
+    assert!(matches!(summary, RunSummary::Halted { .. }));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), logger)
+        .await
+        .expect("log_events must return within 2s of PhaseHalted")
+        .expect("logger task panicked");
+}
+
 /// `Runner::skip_tests(true)` short-circuits test detection: even when the
 /// workspace contains a recognized layout (a `Cargo.toml` here), the runner
 /// emits `TestsSkipped` and never spawns the suite. Phases still advance and

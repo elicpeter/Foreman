@@ -335,13 +335,23 @@ impl<A: Agent, G: Git> Runner<A, G> {
         self.events_tx.subscribe()
     }
 
-    /// Drive the runner until the plan completes or a phase halts. The final
-    /// phase emits [`Event::RunFinished`] before `Finished` is returned.
+    /// Drive the runner until the plan completes or a phase halts.
+    ///
+    /// Always emits exactly one terminal event before returning:
+    /// [`Event::RunFinished`] on the success path, [`Event::PhaseHalted`] on
+    /// the halt path. Subscribers (logger, TUI) treat either event as the
+    /// signal that no further events will arrive — the broadcast channel
+    /// itself does not close because `Runner` keeps owning the sender for
+    /// post-run lookups (e.g., PR creation reads `runner.state()`).
     pub async fn run(&mut self) -> Result<RunSummary> {
         loop {
             let result = self.run_phase().await?;
             match result {
                 PhaseResult::Halted { phase_id, reason } => {
+                    let _ = self.events_tx.send(Event::PhaseHalted {
+                        phase_id: phase_id.clone(),
+                        reason: reason.clone(),
+                    });
                     return Ok(RunSummary::Halted { phase_id, reason });
                 }
                 PhaseResult::Advanced {
@@ -993,15 +1003,27 @@ pub fn fresh_run_state(plan: &Plan, config: &Config, now: chrono::DateTime<Utc>)
 }
 
 /// Subscribe to a runner's event stream and print a human-readable line per
-/// event to stderr until the channel closes.
+/// event to stderr until a terminal event arrives or the channel closes.
 ///
 /// This is the "no TUI" CLI experience: progress is rendered via plain
 /// `tracing::info`-style lines so log piping and CI logs work out of the box.
+///
+/// The runner emits [`Event::RunFinished`] on the success path and
+/// [`Event::PhaseHalted`] on the halt path; this function logs the terminal
+/// event and then returns. Otherwise the broadcast channel would block
+/// forever after `Runner::run()` returns, because the runner itself keeps
+/// holding the [`broadcast::Sender`] for post-run lookups.
 pub async fn log_events(mut rx: broadcast::Receiver<Event>) {
     use broadcast::error::RecvError;
     loop {
         match rx.recv().await {
-            Ok(event) => log_event_line(&event),
+            Ok(event) => {
+                let terminal = matches!(event, Event::RunFinished | Event::PhaseHalted { .. });
+                log_event_line(&event);
+                if terminal {
+                    return;
+                }
+            }
             Err(RecvError::Closed) => return,
             Err(RecvError::Lagged(n)) => {
                 eprintln!("[foreman] (logger lagged: dropped {n} events)");

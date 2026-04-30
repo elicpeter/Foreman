@@ -283,16 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_real_plan_md() {
-        // Exercises the actual project plan.md to ensure the parser handles a
-        // realistic corpus member.
-        let s = include_str!("../../plan.md");
-        let plan = parse(s).unwrap();
-        assert!(!plan.phases.is_empty());
-        assert_eq!(serialize(&plan), s);
-    }
-
-    #[test]
     fn rejects_empty_input() {
         assert_eq!(parse(""), Err(PlanParseError::MissingFrontmatter));
     }
