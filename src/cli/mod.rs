@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod init;
+pub mod run;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,7 +42,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => init::run(std::env::current_dir()?),
         Command::Plan { goal: _ } => unimplemented!("`foreman plan` lands in phase 15"),
-        Command::Run => unimplemented!("`foreman run` lands in phase 12"),
+        Command::Run => run::run(std::env::current_dir()?).await,
         Command::Status => unimplemented!("`foreman status` lands in phase 17"),
         Command::Resume => unimplemented!("`foreman resume` lands in phase 17"),
     }
