@@ -73,9 +73,15 @@ pub async fn run(workspace: PathBuf, goal: String, force: bool, interview: bool)
 
     let effective_goal = if interview {
         let repo_summary = collect_repo_summary(&workspace)?;
-        let spec =
-            crate::cli::interview::conduct(&workspace, &goal, &repo_summary, &cfg, &agent, crate::cli::interview::DEFAULT_MAX_QUESTIONS)
-                .await?;
+        let spec = crate::cli::interview::conduct(
+            &workspace,
+            &goal,
+            &repo_summary,
+            &cfg,
+            &agent,
+            crate::cli::interview::DEFAULT_MAX_QUESTIONS,
+        )
+        .await?;
         format!("{goal}\n\n## Design Specification\n\n{spec}")
     } else {
         goal

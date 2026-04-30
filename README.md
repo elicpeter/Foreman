@@ -205,6 +205,30 @@ The defaults set every role to the latest Opus, which is fine if you don't want 
 
 Configure pricing for any model you reference in `[models]` so `pitboss status` and the USD budget check produce accurate numbers.
 
+## Caveman mode
+
+Pitboss can prepend a "talk like caveman" directive to every agent system prompt to cut output tokens. The idea comes from the [caveman skill](https://github.com/JuliusBrussee/caveman): drop articles, filler words, and pleasantries while keeping technical content exact. Output drops by roughly 65 to 75 percent on prose. Code blocks, commit messages, PR descriptions, and the structured `plan.md` and `deferred.md` artifacts stay in their normal format so downstream parsing is not affected.
+
+Off by default. Turn it on per workspace:
+
+```toml
+[caveman]
+enabled   = true
+intensity = "full"   # one of: lite, full, ultra
+```
+
+Three intensity levels:
+
+| Level   | What it does                                                                       |
+| ------- | ---------------------------------------------------------------------------------- |
+| `lite`  | Drops filler and hedging only. Keeps articles and full sentences. Lowest risk.     |
+| `full`  | Drops articles too, allows fragments, prefers short synonyms. The skill's default. |
+| `ultra` | Heavy abbreviation (DB, auth, fn, impl). Arrows for causality. Most compression.   |
+
+Works on every backend. Claude Code receives the directive via `--append-system-prompt`; Codex and Aider get it concatenated ahead of the user prompt.
+
+One tradeoff worth knowing. The planner, fixer, and auditor each produce output that the next role reads as input. Terser plan and audit prose can lose detail the next role would have used. A reasonable approach is to start with `lite`, watch a run or two, then move up to `full` or `ultra` if the plans and audits still hold up.
+
 ## Agent backends
 
 Pitboss dispatches every implementer / fixer / auditor / planner role through a pluggable backend that wraps an external coding-agent CLI. Pick one in `pitboss.toml`:

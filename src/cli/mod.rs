@@ -111,9 +111,11 @@ pub enum Command {
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => init::run(std::env::current_dir()?),
-        Command::Plan { goal, force, interview } => {
-            plan::run(std::env::current_dir()?, goal, force, interview).await
-        }
+        Command::Plan {
+            goal,
+            force,
+            interview,
+        } => plan::run(std::env::current_dir()?, goal, force, interview).await,
         Command::Run { tui, pr, dry_run } => {
             run::run(std::env::current_dir()?, tui, pr, dry_run).await
         }
