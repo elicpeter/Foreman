@@ -10,8 +10,10 @@
 //!
 //! Phase 01 only stands up the data model. The CLI is not yet wired.
 
+pub mod discovery;
 pub mod prompt;
 
+pub use discovery::{discover_prompts, resolve_home_prompts_dir, DiscoveryOptions, DiscoveryResult};
 pub use prompt::{
     parse_prompt_file, PromptDoc, PromptMeta, PromptMetaValidationError, PromptParseError,
     PromptSource,
