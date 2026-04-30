@@ -358,16 +358,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let payload = vec![b'x'; 1024 * 1024];
-        let outcome = run_logged_with_stdin(
-            cmd,
-            &log,
-            tx,
-            cancel,
-            Duration::from_secs(5),
-            Some(payload),
-        )
-        .await
-        .unwrap();
+        let outcome =
+            run_logged_with_stdin(cmd, &log, tx, cancel, Duration::from_secs(5), Some(payload))
+                .await
+                .unwrap();
         assert_eq!(outcome.stop_reason, StopReason::Completed);
         assert_eq!(outcome.exit_code, 3);
     }
