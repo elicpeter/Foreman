@@ -1,10 +1,14 @@
-//! Integration tests for `pitboss status`, `pitboss resume`, and
-//! `pitboss abort` (phase 17).
+//! Integration tests for `pitboss status`, `pitboss rebuy`, and
+//! `pitboss fold` (phase 17).
 //!
 //! These exercise the binary via `assert_cmd` against a temp workspace so the
 //! full clap-dispatch path runs. Tests that require a halted run pre-populate
 //! `.pitboss/state.json` directly rather than driving the runner — driving the
 //! runner via the CLI requires a real `claude` binary, which CI doesn't have.
+//!
+//! The casino-themed verbs (`play` / `rebuy` / `fold`) are the canonical
+//! names; their pre-rename aliases (`run` / `resume` / `abort`) are kept for
+//! backwards compatibility and verified by [`legacy_aliases_still_work`].
 
 #![cfg(unix)]
 
@@ -53,8 +57,10 @@ fn init_git_repo(dir: &Path) {
     assert!(status.success());
 }
 
-/// Write a `.pitboss/state.json` directly. Mirrors what `pitboss run` would
-/// have persisted after a halt.
+/// Write a `.pitboss/state.json` directly. Mirrors what `pitboss play` would
+/// have persisted after a halt. The on-disk field is still called `aborted`
+/// for backwards compatibility with state files written before the rename;
+/// the user-facing verb is `fold`.
 fn write_state(
     dir: &Path,
     branch: &str,
@@ -122,7 +128,7 @@ fn status_after_state_seeded_shows_run_metadata() {
 }
 
 #[test]
-fn status_marks_aborted_run() {
+fn status_marks_folded_run() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
     write_state(
@@ -138,24 +144,24 @@ fn status_marks_aborted_run() {
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(contains("aborted"));
+        .stdout(contains("folded"));
 }
 
 #[test]
-fn resume_with_no_state_errors_clearly() {
+fn rebuy_with_no_state_errors_clearly() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
 
     pitboss()
-        .arg("resume")
+        .arg("rebuy")
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(contains("no run to resume"));
+        .stderr(contains("no run to rebuy"));
 }
 
 #[test]
-fn resume_with_aborted_state_refuses() {
+fn rebuy_with_folded_state_refuses() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
     init_git_repo(dir.path());
@@ -168,28 +174,28 @@ fn resume_with_aborted_state_refuses() {
     );
 
     pitboss()
-        .arg("resume")
+        .arg("rebuy")
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(contains("aborted"));
+        .stderr(contains("folded"));
 }
 
 #[test]
-fn abort_with_no_state_errors() {
+fn fold_with_no_state_errors() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
 
     pitboss()
-        .arg("abort")
+        .arg("fold")
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(contains("no active run to abort"));
+        .stderr(contains("no active run to fold"));
 }
 
 #[test]
-fn abort_marks_state_aborted_and_persists_flag() {
+fn fold_marks_state_aborted_and_persists_flag() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
     init_git_repo(dir.path());
@@ -201,8 +207,8 @@ fn abort_marks_state_aborted_and_persists_flag() {
         &["01"],
         false,
     );
-    // The branch must exist for `abort --checkout-original` (run by other
-    // tests below) to work; the bare `abort` call doesn't need it but we set
+    // The branch must exist for `fold --checkout-original` (run by other
+    // tests below) to work; the bare `fold` call doesn't need it but we set
     // it up here so we can compose this fixture in a later test if needed.
     PCommand::new("git")
         .args(["-C"])
@@ -212,30 +218,30 @@ fn abort_marks_state_aborted_and_persists_flag() {
         .unwrap();
 
     pitboss()
-        .arg("abort")
+        .arg("fold")
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(contains("aborted run 20260429T143022Z"));
+        .stdout(contains("folded run 20260429T143022Z"));
 
-    // The state file now has aborted=true.
+    // The state file's `aborted` field is still the on-disk source of truth.
     let state_text = fs::read_to_string(dir.path().join(".pitboss/state.json")).unwrap();
     assert!(
         state_text.contains("\"aborted\": true"),
-        "state.json after abort: {state_text}"
+        "state.json after fold: {state_text}"
     );
 
-    // A subsequent `pitboss run` refuses on the aborted state.
+    // A subsequent `pitboss play` refuses on the folded state.
     pitboss()
-        .arg("run")
+        .arg("play")
         .current_dir(dir.path())
         .assert()
         .failure()
-        .stderr(contains("aborted"));
+        .stderr(contains("folded"));
 }
 
 #[test]
-fn abort_idempotent_second_call_is_a_noop_success() {
+fn fold_idempotent_second_call_is_a_noop_success() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
     write_state(
@@ -247,15 +253,15 @@ fn abort_idempotent_second_call_is_a_noop_success() {
     );
 
     pitboss()
-        .arg("abort")
+        .arg("fold")
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(contains("was already aborted"));
+        .stdout(contains("was already folded"));
 }
 
 #[test]
-fn abort_with_checkout_original_switches_branch() {
+fn fold_with_checkout_original_switches_branch() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
     init_git_repo(dir.path());
@@ -275,7 +281,7 @@ fn abort_with_checkout_original_switches_branch() {
     .to_string();
     assert!(!original.is_empty(), "test setup: empty initial branch");
 
-    // Create the per-run branch and switch onto it (mirrors what `pitboss run`
+    // Create the per-run branch and switch onto it (mirrors what `pitboss play`
     // would have done before a halt).
     let run_branch = "pitboss/run-20260429T143022Z";
     PCommand::new("git")
@@ -293,12 +299,12 @@ fn abort_with_checkout_original_switches_branch() {
     write_state(dir.path(), run_branch, Some(&original), &[], false);
 
     pitboss()
-        .arg("abort")
+        .arg("fold")
         .arg("--checkout-original")
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(contains("aborted run"))
+        .stdout(contains("folded run"))
         .stdout(contains(format!("checked out {original}").as_str()));
 
     // Verify HEAD is back on the original branch.
@@ -318,7 +324,7 @@ fn abort_with_checkout_original_switches_branch() {
 }
 
 #[test]
-fn abort_with_checkout_original_errors_when_no_original_recorded() {
+fn fold_with_checkout_original_errors_when_no_original_recorded() {
     let dir = tempdir().unwrap();
     init_workspace(dir.path());
     init_git_repo(dir.path());
@@ -326,10 +332,35 @@ fn abort_with_checkout_original_errors_when_no_original_recorded() {
     write_state(dir.path(), "pitboss/run-x", None, &[], false);
 
     pitboss()
-        .arg("abort")
+        .arg("fold")
         .arg("--checkout-original")
         .current_dir(dir.path())
         .assert()
         .failure()
         .stderr(contains("no original branch is recorded"));
+}
+
+/// The pre-rename verbs (`run`, `resume`, `abort`) keep working as clap
+/// aliases for `play` / `rebuy` / `fold`. This test pins that promise so a
+/// future refactor cannot silently drop the aliases.
+#[test]
+fn legacy_aliases_still_work() {
+    let dir = tempdir().unwrap();
+    init_workspace(dir.path());
+
+    // `abort` aliases `fold`.
+    pitboss()
+        .arg("abort")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(contains("no active run to fold"));
+
+    // `resume` aliases `rebuy`.
+    pitboss()
+        .arg("resume")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(contains("no run to rebuy"));
 }

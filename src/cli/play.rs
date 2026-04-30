@@ -1,4 +1,4 @@
-//! `pitboss run` — execute the plan against the configured agent.
+//! `pitboss play` — execute the plan against the configured agent.
 //!
 //! Loads the workspace's `pitboss.toml`, `plan.md`, `deferred.md`, and
 //! `state.json`; ensures a per-run branch exists; spawns a
@@ -7,13 +7,16 @@
 //!
 //! On a fresh run (state file is `null` or missing) this command derives a new
 //! `run_id` and per-run branch from the current UTC timestamp, captures the
-//! current branch as `original_branch` for `pitboss abort --checkout-original`,
+//! current branch as `original_branch` for `pitboss fold --checkout-original`,
 //! and creates the branch in git. On a continuation (state present) the
-//! existing branch is checked out instead. Phase 17's `pitboss resume` reuses
+//! existing branch is checked out instead. Phase 17's `pitboss rebuy` reuses
 //! [`execute`] with [`StartMode::Resume`] to require an existing state file.
 //!
-//! Aborted runs (`state.aborted == true`) are refused — the user must clear
+//! Folded runs (`state.aborted == true`) are refused, the user must clear
 //! `.pitboss/state.json` to start a new run.
+//!
+//! `pitboss run` is kept as a clap alias of `pitboss play`, so existing
+//! scripts and muscle memory continue to work unchanged.
 
 use std::fs;
 use std::io::Write;
@@ -36,13 +39,13 @@ use crate::tui;
 /// Whether [`execute`] is allowed to start a fresh run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartMode {
-    /// `pitboss run`: a missing or `null` state file kicks off a fresh run.
+    /// `pitboss play`: a missing or `null` state file kicks off a fresh run.
     Fresh,
-    /// `pitboss resume`: a missing state file is an error.
+    /// `pitboss rebuy`: a missing state file is an error.
     Resume,
 }
 
-/// Top-level entry point for the `run` subcommand.
+/// Top-level entry point for the `play` subcommand.
 ///
 /// `tui` toggles between the plain stderr logger (default) and the
 /// `ratatui` dashboard. `pr` opts into the post-run pull-request creation
@@ -54,7 +57,7 @@ pub async fn run(workspace: PathBuf, tui: bool, pr: bool, dry_run: bool) -> Resu
     execute(workspace, tui, pr, dry_run, StartMode::Fresh).await
 }
 
-/// Shared runner driver used by both `pitboss run` and `pitboss resume`.
+/// Shared runner driver used by both `pitboss play` and `pitboss rebuy`.
 ///
 /// `mode` selects fresh-start vs. resume semantics. The function loads config,
 /// the plan, and the deferred doc; reconciles state with `mode`; ensures the
@@ -116,7 +119,7 @@ async fn execute_with_agent<A: Agent + 'static>(
         (Some(s), _) => {
             if s.aborted {
                 bail!(
-                    "state.json marks run {} as aborted; remove .pitboss/state.json to start over",
+                    "run {} was folded; remove .pitboss/state.json to start over",
                     s.run_id
                 );
             }
@@ -130,7 +133,7 @@ async fn execute_with_agent<A: Agent + 'static>(
         }
         (None, StartMode::Resume) => {
             bail!(
-                "no run to resume: .pitboss/state.json is empty; use `pitboss run` to start a fresh run"
+                "no run to rebuy: .pitboss/state.json is empty; use `pitboss play` to start a fresh run"
             );
         }
     };

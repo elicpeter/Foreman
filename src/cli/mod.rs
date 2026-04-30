@@ -1,18 +1,25 @@
 //! Clap command definitions and dispatch.
 //!
-//! `init` is implemented (phase 5); `run` (phase 12), `plan` (phase 15), and
-//! the lifecycle trio `status` / `resume` / `abort` (phase 17) round out the
+//! `init` is implemented (phase 5); `play` (phase 12), `plan` (phase 15), and
+//! the lifecycle trio `status` / `rebuy` / `fold` (phase 17) round out the
 //! current surface. Later phases plug into the same dispatch table.
+//!
+//! The verbs follow the casino theme baked into the binary name: a `play`
+//! executes one phased plan to completion (one hand), `rebuy` picks the run
+//! back up after a halt or fold (buying back into the table), and `fold`
+//! marks the run aborted (this hand is over). For backwards compatibility
+//! every renamed subcommand keeps its original name as a clap alias, so
+//! `pitboss run`, `pitboss resume`, and `pitboss abort` continue to work.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-pub mod abort;
+pub mod fold;
 pub mod init;
 pub mod interview;
 pub mod plan;
-pub mod resume;
-pub mod run;
+pub mod play;
+pub mod rebuy;
 pub mod status;
 
 #[derive(Debug, Parser)]
@@ -65,7 +72,9 @@ pub enum Command {
         interview: bool,
     },
     /// Execute the plan, advancing through phases until done or halted.
-    Run {
+    /// Aliased as `run` for backwards compatibility.
+    #[command(alias = "run")]
+    Play {
         /// Render a live `ratatui` dashboard instead of the plain logger.
         #[arg(long)]
         tui: bool,
@@ -83,24 +92,28 @@ pub enum Command {
     },
     /// Print a summary of the current run.
     Status,
-    /// Resume a halted run from where it left off.
-    Resume {
+    /// Rebuy into a halted run and pick up where it left off. Aliased as
+    /// `resume` for backwards compatibility.
+    #[command(alias = "resume")]
+    Rebuy {
         /// Render a live `ratatui` dashboard instead of the plain logger.
         #[arg(long)]
         tui: bool,
         /// After the resumed run finishes successfully, open a pull request
-        /// via `gh pr create`. Mirrors `pitboss run --pr`.
+        /// via `gh pr create`. Mirrors `pitboss play --pr`.
         #[arg(long)]
         pr: bool,
         /// Swap the configured agent for the deterministic `DryRunAgent`.
-        /// Mirrors `pitboss run --dry-run`.
+        /// Mirrors `pitboss play --dry-run`.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
-    /// Mark the active run as aborted. `pitboss run` and `pitboss resume`
-    /// refuse to operate on an aborted state.
-    Abort {
-        /// After marking the run aborted, switch HEAD back to the branch that
+    /// Fold the active run (mark it aborted). `pitboss play` and `pitboss
+    /// rebuy` refuse to operate on a folded state. Aliased as `abort` for
+    /// backwards compatibility.
+    #[command(alias = "abort")]
+    Fold {
+        /// After marking the run folded, switch HEAD back to the branch that
         /// was checked out when the run began (when known).
         #[arg(long)]
         checkout_original: bool,
@@ -116,15 +129,15 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             force,
             interview,
         } => plan::run(std::env::current_dir()?, goal, force, interview).await,
-        Command::Run { tui, pr, dry_run } => {
-            run::run(std::env::current_dir()?, tui, pr, dry_run).await
+        Command::Play { tui, pr, dry_run } => {
+            play::run(std::env::current_dir()?, tui, pr, dry_run).await
         }
         Command::Status => status::run(std::env::current_dir()?),
-        Command::Resume { tui, pr, dry_run } => {
-            resume::run(std::env::current_dir()?, tui, pr, dry_run).await
+        Command::Rebuy { tui, pr, dry_run } => {
+            rebuy::run(std::env::current_dir()?, tui, pr, dry_run).await
         }
-        Command::Abort { checkout_original } => {
-            abort::run(std::env::current_dir()?, checkout_original).await
+        Command::Fold { checkout_original } => {
+            fold::run(std::env::current_dir()?, checkout_original).await
         }
     }
 }

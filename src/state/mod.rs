@@ -92,7 +92,7 @@ pub struct RunState {
     /// Git branch the runner is committing to.
     pub branch: String,
     /// Branch that was checked out before the run started, captured by
-    /// `pitboss run` on the fresh-run path so `pitboss abort
+    /// `pitboss play` on the fresh-run path so `pitboss fold
     /// --checkout-original` can restore it. `None` when the run was started
     /// before this field existed (older state files) or when the original
     /// branch could not be resolved (detached HEAD).
@@ -108,10 +108,12 @@ pub struct RunState {
     pub attempts: HashMap<PhaseId, u32>,
     /// Aggregated token usage so far.
     pub token_usage: TokenUsage,
-    /// `true` once the run has been explicitly aborted via `pitboss abort`.
-    /// `pitboss run` and `pitboss resume` refuse to act on an aborted run; the
-    /// user must clear `.pitboss/state.json` (e.g., re-run `pitboss init` after
-    /// removing it) to start over.
+    /// `true` once the run has been explicitly folded via `pitboss fold`
+    /// (originally named `pitboss abort`, hence the field name preserved here
+    /// for backwards compatibility with state files written before the
+    /// rename). `pitboss play` and `pitboss rebuy` refuse to act on a folded
+    /// run; the user must clear `.pitboss/state.json` (e.g., re-run
+    /// `pitboss init` after removing it) to start over.
     #[serde(default)]
     pub aborted: bool,
 }

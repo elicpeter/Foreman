@@ -2,7 +2,7 @@
 //!
 //! Drives a one-phase plan through the runner with a [`ScriptedAgent`] (kept
 //! in-file rather than shared with `tests/runner.rs` so each test file stays
-//! self-contained), then exercises [`cli::run::open_post_run_pr`] against a
+//! self-contained), then exercises [`cli::play::open_post_run_pr`] against a
 //! [`ShellGit`] pointed at a fake `gh` fixture script. The fake records its
 //! invocation into a sidecar file in the workspace so we can assert exactly
 //! what title/body the binary received.
@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use pitboss::agent::{Agent, AgentEvent, AgentOutcome, AgentRequest, StopReason};
-use pitboss::cli::run::open_post_run_pr;
+use pitboss::cli::play::open_post_run_pr;
 use pitboss::config::Config;
 use pitboss::deferred::DeferredDoc;
 use pitboss::git::{self, Git, MockGit, MockOp, PrSummary, ShellGit};
@@ -177,7 +177,7 @@ async fn open_post_run_pr_with_shell_git_invokes_fake_gh_with_generated_title_an
     let config = audit_disabled();
     let state = runner::fresh_run_state(&plan, &config, Utc::now());
 
-    // Branch setup mirrors what `cli::run::execute` does on a fresh run.
+    // Branch setup mirrors what `cli::play::execute` does on a fresh run.
     let setup = ShellGit::new(dir.path());
     setup.create_branch(&state.branch).await.unwrap();
     setup.checkout(&state.branch).await.unwrap();

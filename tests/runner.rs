@@ -998,7 +998,7 @@ async fn audit_disabled_path_skips_auditor_entirely() {
 /// Regression test: `runner::log_events` must return after the runner emits
 /// its terminal event, even though the runner keeps holding the broadcast
 /// `Sender` (it's needed for post-run lookups like PR creation). Before this
-/// was wired up, `pitboss run --dry-run` would advance through every phase,
+/// was wired up, `pitboss play --dry-run` would advance through every phase,
 /// print "[pitboss] run finished", and then hang the process forever waiting
 /// on the logger task.
 #[tokio::test]

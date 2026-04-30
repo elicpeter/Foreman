@@ -26,7 +26,7 @@ cp ../pitboss/examples/todo-cli/pitboss.toml pitboss.toml
 ## 3. Sanity check with `--dry-run`
 
 ```sh
-pitboss run --dry-run
+pitboss play --dry-run
 ```
 
 What this exercises with no token spend:
@@ -43,7 +43,7 @@ If anything is wrong with the plan or config, you'll see it here. The dry run le
 ## 4. Run for real
 
 ```sh
-pitboss run
+pitboss play
 ```
 
 Watch the streamed output. Each phase will:
@@ -54,7 +54,7 @@ Watch the streamed output. Each phase will:
 4. (When `audit.enabled`) Print `[pitboss] phase 01 auditor (total dispatch 2)`.
 5. Print `[pitboss] phase 01 committed: <short-sha>`.
 
-If a phase halts, pitboss prints a clear reason and exits non-zero. Run `pitboss status` to see where it stopped, fix the underlying issue, then `pitboss resume`.
+If a phase halts, pitboss prints a clear reason and exits non-zero. Run `pitboss status` to see where it stopped, fix the underlying issue, then `pitboss rebuy`.
 
 ## 5. Inspect the result
 
@@ -68,7 +68,7 @@ ls .pitboss/logs/           # per-attempt agent + test logs for post-mortem
 ## 6. Open a PR (optional)
 
 ```sh
-pitboss run --pr            # or set git.create_pr = true in pitboss.toml
+pitboss play --pr           # or set git.create_pr = true in pitboss.toml
 ```
 
 Pitboss shells out to `gh pr create` with a body listing the completed phases plus any unfinished deferred items.
@@ -78,7 +78,7 @@ Pitboss shells out to `gh pr create` with a body listing the completed phases pl
 If you want to throw the run away:
 
 ```sh
-pitboss abort --checkout-original   # back to the branch you were on at run start
+pitboss fold --checkout-original    # back to the branch you were on at run start
 git branch -D pitboss/run-<utc>     # delete the per-run branch
 rm .pitboss/state.json              # wipe the state breadcrumb
 ```

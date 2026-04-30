@@ -90,7 +90,7 @@ pub fn render_report(
                 "{}: {} {}\n",
                 lbl("run"),
                 col(c, style::BOLD_RED, &s.run_id),
-                dim(&format!("(aborted, started {})", s.started_at.to_rfc3339()))
+                dim(&format!("(folded, started {})", s.started_at.to_rfc3339()))
             ));
             out.push_str(&format!("{}: {}\n", lbl("branch"), s.branch));
             if let Some(orig) = &s.original_branch {
@@ -414,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn report_marks_aborted_run() {
+    fn report_marks_folded_run() {
         let dir = tempdir().unwrap();
         let plan = three_phase_plan();
         let deferred = DeferredDoc::empty();
@@ -422,7 +422,7 @@ mod tests {
         state.aborted = true;
         let config = Config::default();
         let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config, false);
-        assert!(report.contains("aborted"), "report: {report}");
+        assert!(report.contains("folded"), "report: {report}");
     }
 
     #[test]

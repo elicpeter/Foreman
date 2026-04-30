@@ -1,4 +1,4 @@
-//! Auto-generated pull-request title and body for `pitboss run --pr`.
+//! Auto-generated pull-request title and body for `pitboss play --pr`.
 //!
 //! After a run finishes successfully, the runner hands the loaded [`Plan`],
 //! the final [`RunState`], and the current [`DeferredDoc`] to [`pr_body`] /

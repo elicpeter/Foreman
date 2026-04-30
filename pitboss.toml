@@ -17,3 +17,7 @@ small_fix_line_limit = 30
 [git]
 branch_prefix = "pitboss/run-"
 create_pr = false
+
+[caveman]
+enabled = false
+intensity = "full"

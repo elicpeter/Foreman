@@ -254,7 +254,7 @@ pub struct Runner<A: Agent, G: Git> {
     git: G,
     events_tx: broadcast::Sender<Event>,
     /// When `true`, [`Runner::run_phase`] skips test detection and execution.
-    /// Set by `pitboss run --dry-run`, which dispatches the no-op
+    /// Set by `pitboss play --dry-run`, which dispatches the no-op
     /// [`crate::agent::dry_run::DryRunAgent`]: since the agent never modifies
     /// the working tree, running tests would only re-confirm whatever the
     /// pre-run state was and risk halting the dry-run on a flaky suite.
@@ -291,7 +291,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
     }
 
     /// Skip the per-phase test invocation entirely. Used by
-    /// `pitboss run --dry-run` so a no-op agent does not get halted by a
+    /// `pitboss play --dry-run` so a no-op agent does not get halted by a
     /// pre-existing red test suite. The runner emits [`Event::TestsSkipped`]
     /// in place of [`Event::TestStarted`] / [`Event::TestFinished`] so
     /// subscribers (logger, TUI) still get a clear signal that tests were
@@ -381,7 +381,8 @@ impl<A: Agent, G: Git> Runner<A, G> {
     ///
     /// Persists [`RunState`] to `.pitboss/state.json` on every exit — including
     /// halts — so the attempts counter and accumulated token usage survive a
-    /// halted phase and a subsequent `pitboss run` invocation can pick them up.
+    /// halted phase and a subsequent `pitboss play` (or `pitboss rebuy`)
+    /// invocation can pick them up.
     pub async fn run_phase(&mut self) -> Result<PhaseResult> {
         let result = self.run_phase_inner().await;
         if let Err(e) = state::save(&self.workspace, Some(&self.state)) {

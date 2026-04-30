@@ -16,10 +16,10 @@
 Pitboss is a Rust CLI that drives a coding agent through a multi-phase implementation plan. Claude Code is the default; OpenAI's Codex CLI, Aider, and Gemini CLI are also wired in and selectable from `pitboss.toml` (see [Agent backends](#agent-backends)). It runs your test suite after every phase, retries failures with a fixer agent, audits the diff, lands a commit, then moves on. Bounded retries everywhere. Token and dollar budgets. A live TUI if you want to watch.
 
 <div align="center">
-  <img src="assets/pitboss-tui.png" alt="pitboss run --tui dashboard" width="900"/>
+  <img src="assets/pitboss-tui.png" alt="pitboss play --tui dashboard" width="900"/>
 </div>
 <div align="center">
-  <sub align="center"><i>`pitboss run --tui`. The dashboard. Phases on the left, live agent output on the right.</i></sub>
+  <sub align="center"><i>`pitboss play --tui`. The dashboard. Phases on the left, live agent output on the right.</i></sub>
 </div>
 
 ## Contents
@@ -112,8 +112,8 @@ mkdir my-project && cd my-project
 git init
 pitboss init                # scaffold plan.md, deferred.md, pitboss.toml, .pitboss/
 $EDITOR plan.md             # describe the work, phase by phase
-pitboss run --dry-run       # exercise the runner without spending tokens
-pitboss run                 # let the agent loop drive the plan
+pitboss play --dry-run      # exercise the runner without spending tokens
+pitboss play                # let the agent loop drive the plan
 pitboss status              # check progress at any time
 ```
 
@@ -126,10 +126,11 @@ pitboss status              # check progress at any time
 A few entry points worth knowing:
 
 - `pitboss plan "build a CLI todo app in Rust"` has the planner agent draft `plan.md` for you. Add `--interview` to answer design questions first and get a more targeted plan (see [Generating a plan](#generating-a-plan)).
-- `pitboss run --tui` swaps the stderr logger for the dashboard above.
-- `pitboss run --pr` (or `git.create_pr = true`) opens a pull request with `gh pr create` after the run finishes.
-- `pitboss resume` picks up where a halted run left off.
-- `pitboss abort --checkout-original` marks the run aborted and switches HEAD back to the branch you were on before `pitboss run`.
+- `pitboss play --tui` swaps the stderr logger for the dashboard above.
+- `pitboss play --pr` (or `git.create_pr = true`) opens a pull request with `gh pr create` after the run finishes.
+- `pitboss rebuy` picks up where a halted run left off (buying back into the table).
+- `pitboss fold --checkout-original` marks the run folded and switches HEAD back to the branch you were on before `pitboss play`.
+- The pre-rename verbs (`pitboss run`, `pitboss resume`, `pitboss abort`) are kept as aliases, so existing scripts and muscle memory keep working.
 
 ## Generating a plan
 
@@ -172,13 +173,13 @@ For each phase in `plan.md`:
 7. Commit the staged diff to the per-run branch as `[pitboss] phase <id>: <title>`. `plan.md`, `deferred.md`, and `.pitboss/` are excluded from the commit.
 8. Sweep checked-off deferred items, advance `current_phase` in `plan.md`, persist `state.json`, move on.
 
-Every retry is bounded. When a budget is exhausted the runner halts with a clear reason and `pitboss resume` picks up from the same phase.
+Every retry is bounded. When a budget is exhausted the runner halts with a clear reason and `pitboss rebuy` picks up from the same phase.
 
 <div align="center">
   <img src="assets/pitboss-halt.png" alt="pitboss TUI halted on budget exceeded" width="900"/>
 </div>
 <div align="center">
-  <sub align="center"><i>USD budget tripped mid-phase. Pitboss halts, no commit lands, `pitboss resume` picks up from phase 02.</i></sub>
+  <sub align="center"><i>USD budget tripped mid-phase. Pitboss halts, no commit lands, `pitboss rebuy` picks up from phase 02.</i></sub>
 </div>
 
 ## Configuration
@@ -207,7 +208,7 @@ small_fix_line_limit = 30   # line threshold separating "inline" from "defer"
 # Per-run branch and optional PR.
 [git]
 branch_prefix = "pitboss/run-"   # full branch is <prefix><utc_timestamp>
-create_pr     = false            # equivalent to `pitboss run --pr`
+create_pr     = false            # equivalent to `pitboss play --pr`
 
 # Test runner override. Leave commented to auto-detect.
 # [tests]
@@ -358,7 +359,7 @@ Unrecognized layouts skip the test step. The runner then advances on a passing i
 
 ## Dry runs and verbose output
 
-`pitboss run --dry-run` swaps the configured agent for a deterministic no-op and skips test execution. Use it to sanity-check that:
+`pitboss play --dry-run` swaps the configured agent for a deterministic no-op and skips test execution. Use it to sanity-check that:
 
 - `plan.md` parses and `current_phase` resolves to a real heading.
 - `pitboss.toml` parses cleanly with the keys you expect.
@@ -392,7 +393,7 @@ your-project/
 <details>
 <summary><code>run halted at phase NN: plan.md was modified by the agent</code></summary>
 
-The agent wrote to `plan.md`. Pitboss restored the file from snapshot, your plan is intact. Re-read the phase prompt: it likely needs sharper guard rails about not editing planning artifacts. `pitboss resume` retries the same phase.
+The agent wrote to `plan.md`. Pitboss restored the file from snapshot, your plan is intact. Re-read the phase prompt: it likely needs sharper guard rails about not editing planning artifacts. `pitboss rebuy` retries the same phase.
 </details>
 
 <details>
@@ -410,19 +411,19 @@ The implementer plus fixer dispatches together couldn't get the suite green with
 <details>
 <summary><code>run halted at phase NN: budget exceeded: ...</code></summary>
 
-`max_total_tokens` or `max_total_usd` was hit before the next dispatch. `pitboss status` shows the running totals and per-role breakdown. Raise the cap (or clear it) and `pitboss resume`.
+`max_total_tokens` or `max_total_usd` was hit before the next dispatch. `pitboss status` shows the running totals and per-role breakdown. Raise the cap (or clear it) and `pitboss rebuy`.
 </details>
 
 <details>
-<summary><code>state.json marks run X as aborted; remove .pitboss/state.json to start over</code></summary>
+<summary><code>run X was folded; remove .pitboss/state.json to start over</code></summary>
 
-A previous run was aborted with `pitboss abort`. Pitboss keeps the state file as a breadcrumb. Delete `.pitboss/state.json` to start fresh. Everything else (plan, deferred, branch, commits) is preserved.
+A previous run was folded with `pitboss fold` (or its `pitboss abort` alias). Pitboss keeps the state file as a breadcrumb. Delete `.pitboss/state.json` to start fresh. Everything else (plan, deferred, branch, commits) is preserved.
 </details>
 
 <details>
-<summary><code>no run to resume: .pitboss/state.json is empty</code></summary>
+<summary><code>no run to rebuy: .pitboss/state.json is empty</code></summary>
 
-You called `pitboss resume` on a workspace where no run has started. Use `pitboss run` instead.
+You called `pitboss rebuy` on a workspace where no run has started. Use `pitboss play` instead.
 </details>
 
 <details>
