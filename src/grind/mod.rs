@@ -13,6 +13,7 @@
 pub mod discovery;
 pub mod plan;
 pub mod prompt;
+pub mod scheduler;
 pub mod templates;
 
 pub use discovery::{
@@ -26,3 +27,4 @@ pub use prompt::{
     parse_prompt_file, PromptDoc, PromptMeta, PromptMetaValidationError, PromptParseError,
     PromptSource,
 };
+pub use scheduler::{Scheduler, SchedulerState};

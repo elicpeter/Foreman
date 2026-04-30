@@ -446,7 +446,20 @@ pub fn parse(text: &str) -> Result<Config> {
     let cfg: Config = value
         .try_into()
         .context("pitboss.toml does not match the expected schema")?;
+    validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Semantic checks beyond what serde can express. Run after deserialization so
+/// every field has its concrete type.
+fn validate(cfg: &Config) -> Result<()> {
+    if cfg.grind.max_parallel == 0 {
+        anyhow::bail!("pitboss.toml: [grind] max_parallel must be >= 1");
+    }
+    if cfg.grind.consecutive_failure_limit == 0 {
+        anyhow::bail!("pitboss.toml: [grind] consecutive_failure_limit must be >= 1");
+    }
+    Ok(())
 }
 
 /// Walk a parsed `pitboss.toml` value and return any keys not in the schema.
@@ -1042,5 +1055,21 @@ max_parallel = 2
         let value: toml::Value = toml::from_str(text).unwrap();
         let unknown = find_unknown_keys(&value);
         assert!(unknown.contains(&"grind.turbo".to_string()));
+    }
+
+    #[test]
+    fn max_parallel_zero_is_rejected() {
+        let text = "[grind]\nmax_parallel = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("max_parallel"), "msg: {msg}");
+    }
+
+    #[test]
+    fn consecutive_failure_limit_zero_is_rejected() {
+        let text = "[grind]\nconsecutive_failure_limit = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("consecutive_failure_limit"), "msg: {msg}");
     }
 }
