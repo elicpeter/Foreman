@@ -1,10 +1,12 @@
 //! Clap command definitions and dispatch.
 //!
-//! Each subcommand currently returns `unimplemented!()`. They are filled in
-//! across later phases (`init` in phase 5, `run` in phase 12, etc.).
+//! `init` is implemented (phase 5); the remaining subcommands are filled in
+//! across later phases (`run` in phase 12, `status`/`resume` in phase 17, etc.).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+pub mod init;
 
 #[derive(Debug, Parser)]
 #[command(name = "foreman", version, about = "Orchestrate coding agents through a phased plan")]
@@ -30,10 +32,10 @@ pub enum Command {
     Resume,
 }
 
-/// Dispatch a parsed CLI invocation. All branches are stubs in phase 1.
+/// Dispatch a parsed CLI invocation.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init => unimplemented!("`foreman init` lands in phase 5"),
+        Command::Init => init::run(std::env::current_dir()?),
         Command::Plan { goal: _ } => unimplemented!("`foreman plan` lands in phase 15"),
         Command::Run => unimplemented!("`foreman run` lands in phase 12"),
         Command::Status => unimplemented!("`foreman status` lands in phase 17"),
