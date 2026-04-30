@@ -15,7 +15,7 @@
 //!
 //! User-authored `plan.md` content is never overwritten silently — `--force`
 //! is required to clobber an existing file. The one exception is the seed
-//! `pitboss init` writes (see [`crate::cli::init::PLAN_TEMPLATE`]): when the
+//! `pitboss init` writes (see `crate::cli::init::PLAN_TEMPLATE`): when the
 //! existing `plan.md` is byte-identical to that seed, the planner overwrites
 //! it without `--force`, since the user demonstrably hasn't touched it. Any
 //! deviation from the seed (even a single edited word) reverts to the
@@ -61,11 +61,27 @@ pub struct PlanRunOutcome {
 /// Top-level entry point for the `plan` subcommand. Builds the configured
 /// backend via [`agent::build_agent`] and dispatches through
 /// [`run_with_agent`].
-pub async fn run(workspace: PathBuf, goal: String, force: bool) -> Result<()> {
+///
+/// When `interview` is `true`, the agent is first asked to generate targeted
+/// design questions; the user answers them interactively. The Q&A spec is
+/// appended to `goal` before the planner is dispatched, giving the model a
+/// richer context for generating a precise `plan.md`.
+pub async fn run(workspace: PathBuf, goal: String, force: bool, interview: bool) -> Result<()> {
     let cfg = config::load(&workspace)
         .with_context(|| format!("plan: loading config in {}", workspace.display()))?;
     let agent = agent::build_agent(&cfg)?;
-    let outcome = run_with_agent(&workspace, &goal, force, &agent).await?;
+
+    let effective_goal = if interview {
+        let repo_summary = collect_repo_summary(&workspace)?;
+        let spec =
+            crate::cli::interview::conduct(&workspace, &goal, &repo_summary, &cfg, &agent, crate::cli::interview::DEFAULT_MAX_QUESTIONS)
+                .await?;
+        format!("{goal}\n\n## Design Specification\n\n{spec}")
+    } else {
+        goal
+    };
+
+    let outcome = run_with_agent(&workspace, &effective_goal, force, &agent).await?;
     let c = style::use_color_stdout();
     println!(
         "{} {} ({} attempt{})",
@@ -126,7 +142,7 @@ pub async fn run_with_agent<A: Agent>(
         let request = AgentRequest {
             role: Role::Planner,
             model: cfg.models.planner.clone(),
-            system_prompt: String::new(),
+            system_prompt: prompts::caveman::system_prompt(&cfg.caveman),
             user_prompt,
             workdir: workspace.to_path_buf(),
             log_path,

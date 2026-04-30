@@ -33,11 +33,11 @@
 //! verbatim so the dashboard surfaces the run's narrative. In addition, three
 //! prefix patterns are recognized as side-channel events:
 //!
-//! - `Applied edit to <path>` → [`AgentEvent::ToolUse("edit")`]. Mirrors the
+//! - `Applied edit to <path>` → [`AgentEvent::ToolUse`]`("edit")`. Mirrors the
 //!   way [`super::claude_code`] emits Claude's `Edit` tool and
 //!   [`super::codex`] emits `patch` — runs that touch files surface in the
 //!   dashboard alongside other backends.
-//! - `Commit <sha> <message>` → [`AgentEvent::ToolUse("commit")`]. Aider does
+//! - `Commit <sha> <message>` → [`AgentEvent::ToolUse`]`("commit")`. Aider does
 //!   its own `git commit` after applying edits unless `--no-auto-commits` is
 //!   passed via `extra_args`; surfacing those commits as tool-use events
 //!   keeps parity with the runner's other dashboards.

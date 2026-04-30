@@ -34,7 +34,7 @@
 //!   `sh -c "…"` form).
 //! - `mcp_tool_call_begin` (`server`, `tool`) → [`AgentEvent::ToolUse`] carrying
 //!   `<server>.<tool>` so MCP-driven runs surface alongside shell tool calls.
-//! - `patch_apply_begin` → [`AgentEvent::ToolUse("patch")`] so file edits show
+//! - `patch_apply_begin` → [`AgentEvent::ToolUse`]`("patch")` so file edits show
 //!   in the dashboard the same way Claude's `Edit` tool does.
 //! - `token_count` (`info.total_token_usage` with `input_tokens`,
 //!   `cached_input_tokens`, `output_tokens`) → folded into a running

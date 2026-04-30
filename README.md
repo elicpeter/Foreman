@@ -26,6 +26,7 @@ Pitboss is a Rust CLI that drives a coding agent through a multi-phase implement
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Generating a plan](#generating-a-plan)
 - [The run loop](#the-run-loop)
 - [Configuration](#configuration)
 - [Agent backends](#agent-backends)
@@ -90,11 +91,39 @@ pitboss status              # check progress at any time
 
 A few entry points worth knowing:
 
-- `pitboss plan "build a CLI todo app in Rust"` invokes the planner agent to draft `plan.md` for you.
+- `pitboss plan "build a CLI todo app in Rust"` has the planner agent draft `plan.md` for you. Add `--interview` to answer design questions first and get a more targeted plan (see [Generating a plan](#generating-a-plan)).
 - `pitboss run --tui` swaps the stderr logger for the dashboard above.
 - `pitboss run --pr` (or `git.create_pr = true`) opens a pull request with `gh pr create` after the run finishes.
 - `pitboss resume` picks up where a halted run left off.
 - `pitboss abort --checkout-original` marks the run aborted and switches HEAD back to the branch you were on before `pitboss run`.
+
+## Generating a plan
+
+`pitboss plan "my goal"` calls the planner agent to draft `plan.md`. Give it a plain description of the feature or change; the planner also reads the repo layout, manifests, and README for context.
+
+```sh
+pitboss plan "add JSON export to the audit report"
+pitboss plan "add JSON export to the audit report" --force   # overwrite an existing plan.md
+```
+
+### Interview mode
+
+Pass `--interview` and pitboss runs a design session before calling the planner. The agent generates targeted questions about your goal, asks them one by one in the terminal, and uses your answers to write a more concrete `plan.md`.
+
+```sh
+pitboss plan --interview "add a --watch mode to the build CLI"
+```
+
+<div align="center">
+  <img src="assets/pitboss-interview.png" alt="pitboss plan --interview session" width="900"/>
+</div>
+<div align="center">
+  <sub align="center"><i>`pitboss plan --interview`. The agent asks design questions, you answer, then the planner runs with the full context.</i></sub>
+</div>
+
+Questions cover things like interface design, data structures, edge cases, and test approach. Press Enter to skip any question you don't want to answer. The Q&A is compiled into a design spec and handed to the planner alongside the goal, so the resulting plan reflects decisions you made up front rather than ones the agent guessed at.
+
+The number of questions varies with the goal; the agent caps at 50.
 
 ## The run loop
 
@@ -358,7 +387,7 @@ The [`examples/`](examples) directory contains a walkthrough plan you can copy i
 ```
 src/
 ├── main.rs          CLI entry, wires the tracing subscriber
-├── cli/             clap commands (init, plan, run, status, resume, abort)
+├── cli/             clap commands (init, plan, run, status, resume, abort, interview)
 ├── plan/            Plan/Phase types, parser, snapshot
 ├── deferred/        DeferredDoc/items/phases, parser
 ├── state/           RunState, atomic IO

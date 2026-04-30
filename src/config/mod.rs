@@ -54,6 +54,10 @@ pub struct Config {
     /// Backend selection and per-backend overrides. A missing `[agent]`
     /// section keeps today's behavior (Claude Code).
     pub agent: AgentConfig,
+    /// Optional terse-output mode. When `caveman.enabled` is `true` the
+    /// runner prepends a "talk like caveman" directive to every agent
+    /// dispatch's system prompt to cut output tokens.
+    pub caveman: CavemanConfig,
 }
 
 /// Model identifiers used for each agent role. Strings are passed verbatim to
@@ -277,6 +281,45 @@ pub struct AgentConfig {
     pub gemini: BackendOverrides,
 }
 
+/// `[caveman]` section — opt-in terse-response mode that prepends a
+/// "talk like caveman" directive to the system prompt of every agent
+/// dispatch. The skill itself is from <https://github.com/JuliusBrussee/caveman>;
+/// pitboss inlines the directive rather than depending on the plugin so the
+/// same behavior applies to every backend (Claude Code, Codex, Aider).
+///
+/// Disabled by default — token-budget reductions come at the cost of slightly
+/// terser plan/audit/fix prose, which can lose detail downstream roles depend
+/// on. Enable per-workspace when output token spend is the bottleneck.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CavemanConfig {
+    /// Master switch. When `false` (the default) the directive is the empty
+    /// string and pitboss behaves exactly as it did before this section
+    /// existed.
+    pub enabled: bool,
+    /// Terseness level. `lite` drops only filler words; `full` (the skill's
+    /// canonical default) also drops articles and allows fragments; `ultra`
+    /// abbreviates aggressively. See [`CavemanIntensity`] for details.
+    pub intensity: CavemanIntensity,
+}
+
+/// Caveman terseness level. See [`CavemanConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CavemanIntensity {
+    /// Drop only filler/hedging. Keep articles + full sentences. Professional
+    /// but tight. Lowest risk to downstream artifact quality.
+    Lite,
+    /// The skill's canonical default. Drop articles, fragments OK, short
+    /// synonyms. Classic caveman.
+    #[default]
+    Full,
+    /// Maximum compression. Abbreviate (DB/auth/config/req/res/fn/impl),
+    /// arrows for causality (X → Y), one word when one word does. Highest
+    /// risk to downstream artifact readability.
+    Ultra,
+}
+
 /// Per-backend overrides shared by every backend table.
 ///
 /// Every field is optional / additive — defaults match today's behavior
@@ -352,6 +395,7 @@ fn find_unknown_keys(value: &toml::Value) -> Vec<String> {
             // tradeoff — backend adapters may grow new fields without forcing
             // a config-schema bump.
             "agent" => &["backend", "claude_code", "codex", "aider", "gemini"],
+            "caveman" => &["enabled", "intensity"],
             _ => {
                 out.push(section.clone());
                 continue;
@@ -396,6 +440,67 @@ mod tests {
         // Agent backend defaults to unset → factory selects ClaudeCode.
         assert_eq!(cfg.agent, AgentConfig::default());
         assert_eq!(cfg.agent.backend, None);
+        // Caveman mode is opt-in — disabled by default with intensity `full`
+        // so a workspace with no `[caveman]` section behaves identically to
+        // pre-feature pitboss.
+        assert!(!cfg.caveman.enabled);
+        assert_eq!(cfg.caveman.intensity, CavemanIntensity::Full);
+    }
+
+    #[test]
+    fn caveman_section_round_trips_full_form() {
+        let text = "
+[caveman]
+enabled = true
+intensity = \"ultra\"
+";
+        let cfg = parse(text).unwrap();
+        assert!(cfg.caveman.enabled);
+        assert_eq!(cfg.caveman.intensity, CavemanIntensity::Ultra);
+
+        // Canonical input must not trip the unknown-keys walker.
+        let value: toml::Value = toml::from_str(text).unwrap();
+        assert!(find_unknown_keys(&value).is_empty());
+    }
+
+    #[test]
+    fn caveman_section_accepts_each_intensity_level() {
+        for (s, expected) in [
+            ("lite", CavemanIntensity::Lite),
+            ("full", CavemanIntensity::Full),
+            ("ultra", CavemanIntensity::Ultra),
+        ] {
+            let text = format!("[caveman]\nenabled = true\nintensity = \"{s}\"\n");
+            let cfg = parse(&text).unwrap();
+            assert_eq!(cfg.caveman.intensity, expected, "intensity {s}");
+        }
+    }
+
+    #[test]
+    fn caveman_section_rejects_unknown_intensity() {
+        let text = "
+[caveman]
+enabled = true
+intensity = \"galaxybrain\"
+";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("expected schema"),
+            "expected schema error for unknown intensity, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn caveman_unknown_subkeys_are_flagged() {
+        let text = "
+[caveman]
+enabled = true
+mode = \"wenyan\"
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let unknown = find_unknown_keys(&value);
+        assert!(unknown.contains(&"caveman.mode".to_string()));
     }
 
     #[test]

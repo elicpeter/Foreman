@@ -23,6 +23,8 @@
 //! one snapshot review away from being merged. Run
 //! `cargo insta review --workspace` to accept new snapshots.
 
+pub mod caveman;
+
 use crate::deferred::{self, DeferredDoc};
 use crate::plan::{Phase, Plan};
 
@@ -30,6 +32,7 @@ const IMPLEMENTER_TEMPLATE: &str = include_str!("templates/implementer.txt");
 const AUDITOR_TEMPLATE: &str = include_str!("templates/auditor.txt");
 const FIXER_TEMPLATE: &str = include_str!("templates/fixer.txt");
 const PLANNER_TEMPLATE: &str = include_str!("templates/planner.txt");
+const QUESTIONER_TEMPLATE: &str = include_str!("templates/questioner.txt");
 
 /// Approximate ceiling on the static portion of any single template.
 ///
@@ -96,6 +99,21 @@ pub fn planner(goal: &str, repo_summary: &str) -> String {
     render(
         PLANNER_TEMPLATE,
         &[("goal", goal), ("repo_summary", repo_summary)],
+    )
+}
+
+/// Render the questioner prompt used by `pitboss plan --interview`. Asks the
+/// agent to produce a numbered list of design questions (at most
+/// `max_questions`) tailored to the goal and repo context.
+pub fn questioner(goal: &str, repo_summary: &str, max_questions: u32) -> String {
+    let max = max_questions.to_string();
+    render(
+        QUESTIONER_TEMPLATE,
+        &[
+            ("goal", goal),
+            ("repo_summary", repo_summary),
+            ("max_questions", &max),
+        ],
     )
 }
 
@@ -394,6 +412,7 @@ mod tests {
             ("auditor", AUDITOR_TEMPLATE),
             ("fixer", FIXER_TEMPLATE),
             ("planner", PLANNER_TEMPLATE),
+            ("questioner", QUESTIONER_TEMPLATE),
         ] {
             assert!(
                 body.len() <= TEMPLATE_STATIC_BUDGET,
@@ -433,5 +452,22 @@ mod tests {
         let goal = "Build a CLI todo app in Rust with JSON persistence.";
         let repo_summary = "(empty repository)";
         insta::assert_snapshot!(planner(goal, repo_summary));
+    }
+
+    #[test]
+    fn questioner_embeds_goal_and_max() {
+        let out = questioner("Build a CLI todo app", "(empty repository)", 20);
+        assert!(out.contains("Build a CLI todo app"));
+        assert!(out.contains("20"));
+        assert!(out.contains("numbered list"));
+        assert!(!out.contains("{goal}"));
+        assert!(!out.contains("{max_questions}"));
+    }
+
+    #[test]
+    fn snapshot_questioner() {
+        let goal = "Add a --interview flag to pitboss plan.";
+        let repo_summary = "(empty repository)";
+        insta::assert_snapshot!(questioner(goal, repo_summary, 25));
     }
 }

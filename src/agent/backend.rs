@@ -19,7 +19,7 @@ use anyhow::anyhow;
 
 /// Which underlying agent backend pitboss should drive.
 ///
-/// Round-trips through [`Display`] / [`FromStr`] as the canonical lowercase
+/// Round-trips through [`fmt::Display`] / [`FromStr`] as the canonical lowercase
 /// underscored string used in `pitboss.toml` (`claude_code`, `codex`, `aider`,
 /// `gemini`). [`Self::default`] is [`Self::ClaudeCode`], so a workspace with
 /// no `[agent]` section keeps today's behavior.

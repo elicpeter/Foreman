@@ -72,6 +72,13 @@ small_fix_line_limit = 30
 [git]
 branch_prefix = \"pitboss/run-\"
 create_pr = false
+
+# Caveman mode: opt-in terse-output directive prepended to every agent
+# dispatch's system prompt. Cuts output tokens at the cost of slightly
+# terser plan/audit/fix prose. Intensity: \"lite\" | \"full\" | \"ultra\".
+[caveman]
+enabled = false
+intensity = \"full\"
 ";
 
 /// Marker line appended to `.gitignore`. Matched verbatim against trimmed

@@ -1,0 +1,28 @@
+---
+source: src/prompts/mod.rs
+expression: "questioner(goal, repo_summary, 25)"
+---
+You are a design interviewer. Given a goal and a repository overview, generate a numbered list of targeted design questions to help produce a precise implementation spec before planning begins.
+
+Generate between 20 and 25 questions. Cover:
+- Core requirements and constraints
+- Technical choices: algorithms, data structures, libraries to use or avoid
+- Interface design: CLI flags, output format, error messages, user flow
+- Architecture: module layout, key abstractions, naming conventions
+- Integration with existing code, APIs, or external tools
+- Edge cases and failure modes
+- Testing approach
+
+Output ONLY a numbered list. One question per line. No preamble, no commentary, no section headers.
+
+1. First question?
+2. Second question?
+...
+
+# Goal
+
+Add a --interview flag to pitboss plan.
+
+# Repository overview
+
+(empty repository)

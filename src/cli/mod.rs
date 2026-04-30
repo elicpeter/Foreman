@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 
 pub mod abort;
 pub mod init;
+pub mod interview;
 pub mod plan;
 pub mod resume;
 pub mod run;
@@ -56,6 +57,12 @@ pub enum Command {
         /// seed is replaced silently and does not require `--force`.
         #[arg(long)]
         force: bool,
+        /// Conduct a design interview before generating the plan. The agent
+        /// generates targeted questions about the feature; your answers are
+        /// compiled into a design spec and woven into the planner prompt,
+        /// producing a more precise and complete `plan.md`.
+        #[arg(long)]
+        interview: bool,
     },
     /// Execute the plan, advancing through phases until done or halted.
     Run {
@@ -104,7 +111,9 @@ pub enum Command {
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => init::run(std::env::current_dir()?),
-        Command::Plan { goal, force } => plan::run(std::env::current_dir()?, goal, force).await,
+        Command::Plan { goal, force, interview } => {
+            plan::run(std::env::current_dir()?, goal, force, interview).await
+        }
         Command::Run { tui, pr, dry_run } => {
             run::run(std::env::current_dir()?, tui, pr, dry_run).await
         }

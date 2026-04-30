@@ -194,10 +194,10 @@ impl<A: Agent + ?Sized> Agent for Box<A> {
 /// Construct the agent the runner should dispatch through, based on
 /// `pitboss.toml`'s `[agent] backend` selector.
 ///
-/// A missing or absent `backend` falls back to [`BackendKind::default`]
+/// A missing or absent `backend` falls back to [`backend::BackendKind::default`]
 /// (Claude Code) so workspaces without an `[agent]` section keep today's
 /// behavior. Unknown backend strings surface a parse error from
-/// [`BackendKind::from_str`]. Backends other than `claude_code` return a
+/// [`backend::BackendKind`]'s [`std::str::FromStr`] impl. Backends other than `claude_code` return a
 /// clear "not yet implemented" error pending their adapter phases — the
 /// dispatch path is in place so wiring those up is a single match arm.
 pub fn build_agent(cfg: &crate::config::Config) -> Result<Box<dyn Agent + Send + Sync>> {

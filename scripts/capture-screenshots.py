@@ -440,6 +440,107 @@ def run_vhs(tape: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Interview scene
+# ---------------------------------------------------------------------------
+
+# A self-contained bash script that simulates `pitboss plan --interview`.
+# Echoes pre-canned questions and answers with the correct ANSI palette so
+# the screenshot looks like a real session. Called by the vhs tape in place
+# of the real binary.
+INTERVIEW_WRAPPER_TEMPLATE = """\
+#!/usr/bin/env bash
+set -e
+PITBOSS_REAL="{pitboss_bin}"
+if [[ "$1" == "plan" && "$2" == "--interview" ]]; then
+  R="\\033[0m"; BC="\\033[1;36m"; M="\\033[35m"; BG="\\033[1;32m"; D="\\033[2m"; C="\\033[36m"
+  printf "${{BC}}[pitboss]${{R}} ${{M}}generating design questions...${{R}}\\n" >&2
+  sleep 0.3
+  printf "${{BC}}[pitboss]${{R}} ${{BG}}interview:${{R}} 8 ${{D}}questions ready — press Enter to skip any question${{R}}\\n" >&2
+  questions=(
+    "What file changes should trigger a rebuild (all files, or specific extensions like .rs)?"
+    "Should the watcher debounce rapid saves, and if so what delay?"
+    "Does watch mode need its own per-run branch, or reuse the current branch?"
+    "Should watch runs commit after each phase, or only after the full plan finishes?"
+    "Which directories to exclude from watching (target/, .pitboss/, node_modules/)?"
+    "Should the TUI be on by default in watch mode?"
+    "How should watch mode handle a run that halts mid-plan?"
+    "Is there a cap on watch-triggered runs, or does Ctrl-C stop it?"
+  )
+  answers=(
+    ".rs and .toml files"
+    "yes, 500ms debounce"
+    "own branch with a pitboss/watch- prefix"
+    "after each phase, same as a normal run"
+    "target, .pitboss, node_modules"
+    "yes — makes sense for a long-running session"
+    "pause and wait, resume on the next file change"
+    "Ctrl-C only, no cap"
+  )
+  total=${{#questions[@]}}
+  for i in "${{!questions[@]}}"; do
+    n=$((i + 1))
+    printf "\\n[%s/%s] %s\\n" "$n" "$total" "${{questions[$i]}}"
+    printf "> "
+    sleep 0.05
+    printf "%s\\n" "${{answers[$i]}}"
+  done
+  printf "\\n" >&2
+  printf "${{BC}}[pitboss]${{R}} ${{BG}}interview complete${{R}} (8 answered)\\n" >&2
+  printf "${{BC}}[pitboss]${{R}} ${{M}}dispatching planner${{R}} ${{C}}claude-opus-4-7${{R}} (attempt 1/2)\\n" >&2
+  printf "${{BC}}[pitboss]${{R}} ${{D}}live log: .pitboss/logs/planner-attempt-1.log${{R}}\\n" >&2
+  sleep 0.3
+  printf "${{BG}}wrote${{R}} plan.md (1 attempt)\\n"
+else
+  exec "$PITBOSS_REAL" "$@"
+fi
+"""
+
+
+def setup_interview_scene(workdir: Path) -> Path:
+    """Write the interview wrapper script and return its directory."""
+    wrapper_dir = workdir / "interview-bin"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = wrapper_dir / "pitboss"
+    wrapper.write_text(
+        INTERVIEW_WRAPPER_TEMPLATE.format(pitboss_bin=str(PITBOSS_BIN))
+    )
+    wrapper.chmod(0o755)
+    return wrapper_dir
+
+
+def write_interview_tape(tape_path: Path, output_png: Path, wrapper_dir: Path) -> None:
+    """Write a vhs tape for the interview scene.
+
+    The command contains double quotes so we need single-quoted Type args;
+    the wrapper intercepts `pitboss plan --interview ...` and simulates output.
+    """
+    pitboss_bin_dir = str(PITBOSS_BIN.parent)
+    setup = (
+        f'  Type "export PATH={wrapper_dir}:{pitboss_bin_dir}:$PATH"\n  Enter\n  Sleep 200ms\n'
+        '  Type "clear"\n  Enter\n  Sleep 200ms\n'
+    )
+    tape = f"""Output "{output_png}"
+
+Set Theme "{VHS_THEME}"
+Set FontSize {VHS_FONT_SIZE}
+Set Width 1200
+Set Height 680
+Set Padding {VHS_PADDING}
+Set Shell "bash"
+
+Hide
+{setup}  Type 'pitboss plan --interview "add a --watch mode to the build CLI"'
+  Enter
+  Sleep 4500ms
+Show
+Sleep 2000ms
+Screenshot "{output_png}"
+Sleep 300ms
+"""
+    tape_path.write_text(tape)
+
+
+# ---------------------------------------------------------------------------
 # Scene driver
 # ---------------------------------------------------------------------------
 
@@ -459,11 +560,13 @@ def capture_all() -> None:
         tmp = Path(tmp)
         demo_dir = tmp / "demo"
         status_dir = tmp / "status-workspace"
+        interview_dir = tmp / "interview"
         captures = tmp / "captures"
         captures.mkdir()
 
         demo_bin = build_demo_binary(demo_dir)
         setup_status_workspace(status_dir)
+        interview_wrapper_dir = setup_interview_scene(interview_dir)
 
         scenes: list[tuple[str, str, int, int]] = [
             # name           command                w     h
@@ -479,6 +582,13 @@ def capture_all() -> None:
             write_tape(tape, png, command, width=w, height=h, cwd=cwd)
             run_vhs(tape)
             frame_png(png, ASSETS / f"{name}.png")
+
+        # Interview scene uses a custom tape (quoted command, different setup).
+        interview_tape = captures / "pitboss-interview.tape"
+        interview_png = captures / "pitboss-interview.png"
+        write_interview_tape(interview_tape, interview_png, interview_wrapper_dir)
+        run_vhs(interview_tape)
+        frame_png(interview_png, ASSETS / "pitboss-interview.png")
 
     log("done")
 

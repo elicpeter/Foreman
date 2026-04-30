@@ -31,7 +31,14 @@ pub fn run(workspace: PathBuf) -> Result<()> {
     let config = config::load(&workspace)
         .with_context(|| format!("status: loading config in {:?}", workspace))?;
 
-    let report = render_report(&workspace, &plan, &deferred, state.as_ref(), &config);
+    let report = render_report(
+        &workspace,
+        &plan,
+        &deferred,
+        state.as_ref(),
+        &config,
+        crate::style::use_color_stdout(),
+    );
     print!("{}", report);
     Ok(())
 }
@@ -40,16 +47,18 @@ pub fn run(workspace: PathBuf) -> Result<()> {
 /// state so tests can exercise it without shelling out to git for the
 /// last-commit lookup; the workspace is only used to query git, and the
 /// internal `last_commit_subject` helper swallows errors so a non-git
-/// workspace still produces a useful report.
+/// workspace still produces a useful report. `color` controls ANSI styling
+/// so callers (and tests) decide rather than probing terminal state here.
 pub fn render_report(
     workspace: &Path,
     plan: &Plan,
     deferred: &DeferredDoc,
     state: Option<&RunState>,
     config: &Config,
+    color: bool,
 ) -> String {
     use crate::style::{self, col};
-    let c = style::use_color_stdout();
+    let c = color;
 
     // Label in cyan, muted parenthetical text.
     let lbl = |key: &str| col(c, style::CYAN, key);
@@ -334,7 +343,7 @@ mod tests {
         let plan = three_phase_plan();
         let deferred = DeferredDoc::empty();
         let config = Config::default();
-        let report = render_report(dir.path(), &plan, &deferred, None, &config);
+        let report = render_report(dir.path(), &plan, &deferred, None, &config, false);
         assert!(report.contains("run: not started"), "report: {report}");
         // Plan header still rendered so users see what the seed plan looks like.
         assert!(report.contains("plan: phase 02 of 3"), "report: {report}");
@@ -367,7 +376,7 @@ mod tests {
         };
         let state = sample_state();
         let config = Config::default();
-        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config);
+        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config, false);
 
         assert!(report.contains("run: 20260429T143022Z"), "report: {report}");
         assert!(
@@ -412,7 +421,7 @@ mod tests {
         let mut state = sample_state();
         state.aborted = true;
         let config = Config::default();
-        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config);
+        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config, false);
         assert!(report.contains("aborted"), "report: {report}");
     }
 
@@ -424,7 +433,7 @@ mod tests {
         let mut state = sample_state();
         state.completed.clear();
         let config = Config::default();
-        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config);
+        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config, false);
         assert!(report.contains("completed: (none)"), "report: {report}");
     }
 
@@ -437,7 +446,7 @@ mod tests {
         let mut config = Config::default();
         config.budgets.max_total_tokens = Some(10_000);
         config.budgets.max_total_usd = Some(1.00);
-        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config);
+        let report = render_report(dir.path(), &plan, &deferred, Some(&state), &config, false);
         // 100 input + 50 output = 150 tokens used; cap 10000; 9850 remaining.
         assert!(
             report.contains("token budget: 150/10000 used, 9850 remaining"),

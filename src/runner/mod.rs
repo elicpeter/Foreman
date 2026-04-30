@@ -422,7 +422,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
         let request = AgentRequest {
             role: Role::Implementer,
             model: self.config.models.implementer.clone(),
-            system_prompt: String::new(),
+            system_prompt: prompts::caveman::system_prompt(&self.config.caveman),
             user_prompt,
             workdir: self.workspace.clone(),
             log_path,
@@ -739,7 +739,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
             let request = AgentRequest {
                 role: Role::Fixer,
                 model: self.config.models.fixer.clone(),
-                system_prompt: String::new(),
+                system_prompt: prompts::caveman::system_prompt(&self.config.caveman),
                 user_prompt,
                 workdir: self.workspace.clone(),
                 log_path,
@@ -838,7 +838,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
         let request = AgentRequest {
             role: Role::Auditor,
             model: self.config.models.auditor.clone(),
-            system_prompt: String::new(),
+            system_prompt: prompts::caveman::system_prompt(&self.config.caveman),
             user_prompt,
             workdir: self.workspace.clone(),
             log_path,
