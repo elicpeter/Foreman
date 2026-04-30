@@ -5,6 +5,7 @@
 
 **A coding-agent pitboss.** Hand it a phased plan, walk away, come back to a branch full of green commits.
 
+[![crates.io](https://img.shields.io/crates/v/pitboss.svg)](https://crates.io/crates/pitboss)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-007EC6)](#license)
 [![Agents](https://img.shields.io/badge/agents-Claude%20%C2%B7%20Codex%20%C2%B7%20Aider%20%C2%B7%20Gemini-7C3AED)](#agent-backends)
