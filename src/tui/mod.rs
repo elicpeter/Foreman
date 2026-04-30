@@ -45,7 +45,8 @@ use crate::runner::{Event, RunSummary, Runner};
 /// alternate-screen / raw mode, and runs the input + render loop concurrently
 /// with [`Runner::run`]. Returns whatever the runner returned, or `None`
 /// when the user quit before the runner finished. The terminal is always
-/// restored before this function returns.
+/// restored before this function returns — including on early-return
+/// errors and unwinding panics — so mouse capture never outlives the run.
 pub async fn run<A, G>(runner: &mut Runner<A, G>) -> Result<Option<RunSummary>>
 where
     A: Agent + Send + Sync + 'static,
@@ -55,16 +56,16 @@ where
     let state = runner.state().clone();
     let rx = runner.subscribe();
 
-    let mut terminal = setup_terminal().context("tui: setting up terminal")?;
+    let mut guard = TerminalGuard::setup().context("tui: setting up terminal")?;
     let app = App::new(plan, state);
 
     let outcome = tokio::select! {
         biased;
-        result = run_loop(&mut terminal, app, rx) => Outcome::User(result?),
+        result = run_loop(guard.terminal(), app, rx) => Outcome::User(result?),
         result = runner.run() => Outcome::Runner(result?),
     };
 
-    restore_terminal(&mut terminal).context("tui: restoring terminal")?;
+    guard.restore().context("tui: restoring terminal")?;
 
     match outcome {
         Outcome::Runner(summary) => Ok(Some(summary)),
@@ -87,24 +88,67 @@ enum UserOutcome {
     ChannelClosed,
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
-    Ok(terminal)
+/// RAII wrapper around the terminal setup/teardown.
+///
+/// `Drop` does a best-effort restore so an unwinding panic or an early-return
+/// `?` inside [`run`] does not leak raw mode / mouse capture into the user's
+/// shell — that would cause the terminal to echo SGR mouse-tracking escape
+/// sequences as visible input on every mouse movement after pitboss exits.
+/// The explicit [`Self::restore`] path surfaces teardown errors when nothing
+/// else has gone wrong; the `Drop` path swallows them because we cannot
+/// usefully report errors during unwinding.
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    active: bool,
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
+impl TerminalGuard {
+    fn setup() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self {
+            terminal,
+            active: true,
+        })
+    }
+
+    fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
+        &mut self.terminal
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        disable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 /// Frame interval. Aggressive enough for streaming agent output to feel

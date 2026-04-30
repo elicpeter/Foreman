@@ -29,8 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::claude_code::ClaudeCodeAgent;
-use crate::agent::{Agent, AgentEvent, AgentRequest, Role, StopReason};
+use crate::agent::{self, Agent, AgentEvent, AgentRequest, Role, StopReason};
 use crate::config;
 use crate::plan;
 use crate::prompts;
@@ -59,10 +58,13 @@ pub struct PlanRunOutcome {
     pub attempts: u32,
 }
 
-/// Top-level entry point for the `plan` subcommand. Builds a real
-/// [`ClaudeCodeAgent`] and dispatches via [`run_with_agent`].
+/// Top-level entry point for the `plan` subcommand. Builds the configured
+/// backend via [`agent::build_agent`] and dispatches through
+/// [`run_with_agent`].
 pub async fn run(workspace: PathBuf, goal: String, force: bool) -> Result<()> {
-    let agent = ClaudeCodeAgent::new();
+    let cfg = config::load(&workspace)
+        .with_context(|| format!("plan: loading config in {}", workspace.display()))?;
+    let agent = agent::build_agent(&cfg)?;
     let outcome = run_with_agent(&workspace, &goal, force, &agent).await?;
     let c = style::use_color_stdout();
     println!(
@@ -77,7 +79,8 @@ pub async fn run(workspace: PathBuf, goal: String, force: bool) -> Result<()> {
 
 /// Test-friendly entry point that accepts any [`Agent`]. Tests pass a
 /// `DryRunAgent` whose stdout script holds canned plan.md bodies; production
-/// passes a `ClaudeCodeAgent`.
+/// passes whatever backend [`agent::build_agent`] selected from
+/// `pitboss.toml`.
 pub async fn run_with_agent<A: Agent>(
     workspace: &Path,
     goal: &str,

@@ -23,9 +23,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use tokio::task::JoinHandle;
 
-use crate::agent::claude_code::ClaudeCodeAgent;
 use crate::agent::dry_run::{DryRunAgent, DryRunFinal};
-use crate::agent::{Agent, AgentEvent};
+use crate::agent::{self, Agent, AgentEvent};
 use crate::config;
 use crate::deferred::{self, DeferredDoc};
 use crate::git::{self, Git, PrSummary, ShellGit};
@@ -69,7 +68,7 @@ pub async fn run(workspace: PathBuf, tui: bool, pr: bool, dry_run: bool) -> Resu
 /// failures are reported but do not change the function's exit status — the
 /// underlying run already succeeded.
 ///
-/// When `dry_run` is `true` the [`ClaudeCodeAgent`] is swapped for a
+/// When `dry_run` is `true` the configured backend is swapped for a
 /// scripted [`DryRunAgent`] that emits a single stdout marker and returns
 /// success with zero tokens. The runner is also told to
 /// [`Runner::skip_tests`], because the no-op agent never modifies the
@@ -88,7 +87,10 @@ pub async fn execute(
     if dry_run {
         execute_with_agent(workspace, tui, false, mode, dry_run_agent()).await
     } else {
-        execute_with_agent(workspace, tui, pr_flag, mode, ClaudeCodeAgent::new()).await
+        let cfg = config::load(&workspace)
+            .with_context(|| format!("run: loading config in {:?}", workspace))?;
+        let agent = agent::build_agent(&cfg)?;
+        execute_with_agent(workspace, tui, pr_flag, mode, agent).await
     }
 }
 

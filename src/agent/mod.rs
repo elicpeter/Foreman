@@ -19,6 +19,7 @@
 //! Implementations **must** honor both the supplied `cancel`
 //! [`tokio_util::sync::CancellationToken`] and `req.timeout`.
 
+pub mod backend;
 pub mod claude_code;
 pub mod dry_run;
 pub mod subprocess;
@@ -166,6 +167,55 @@ pub trait Agent: Send + Sync {
     ) -> Result<AgentOutcome>;
 }
 
+/// Blanket impl so `Box<dyn Agent + Send + Sync>` satisfies the `Agent`
+/// bound the runner and CLI helpers carry. Enables [`build_agent`] to return
+/// a heap-allocated trait object that flows through generic call sites
+/// (`Runner::new<A: Agent + 'static>`, `run_with_agent<A: Agent>`) without
+/// every caller having to depend on the concrete backend type.
+#[async_trait]
+impl<A: Agent + ?Sized> Agent for Box<A> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    async fn run(
+        &self,
+        req: AgentRequest,
+        events: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> Result<AgentOutcome> {
+        (**self).run(req, events, cancel).await
+    }
+}
+
+/// Construct the agent the runner should dispatch through, based on
+/// `pitboss.toml`'s `[agent] backend` selector.
+///
+/// A missing or absent `backend` falls back to [`BackendKind::default`]
+/// (Claude Code) so workspaces without an `[agent]` section keep today's
+/// behavior. Unknown backend strings surface a parse error from
+/// [`BackendKind::from_str`]. Backends other than `claude_code` return a
+/// clear "not yet implemented" error pending their adapter phases — the
+/// dispatch path is in place so wiring those up is a single match arm.
+pub fn build_agent(cfg: &crate::config::Config) -> Result<Box<dyn Agent + Send + Sync>> {
+    let kind = match cfg.agent.backend.as_deref() {
+        None => backend::BackendKind::default(),
+        Some(s) => s.parse::<backend::BackendKind>()?,
+    };
+    match kind {
+        backend::BackendKind::ClaudeCode => Ok(Box::new(claude_code::ClaudeCodeAgent::new())),
+        backend::BackendKind::Codex => Err(anyhow::anyhow!(
+            "backend 'codex' is not yet implemented"
+        )),
+        backend::BackendKind::Aider => Err(anyhow::anyhow!(
+            "backend 'aider' is not yet implemented"
+        )),
+        backend::BackendKind::Gemini => Err(anyhow::anyhow!(
+            "backend 'gemini' is not yet implemented"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +242,63 @@ mod tests {
         assert_ne!(StopReason::Completed, StopReason::Timeout);
         assert_eq!(StopReason::Error("x".into()), StopReason::Error("x".into()));
         assert_ne!(StopReason::Error("x".into()), StopReason::Error("y".into()));
+    }
+
+    #[test]
+    fn build_agent_defaults_to_claude_code_when_unspecified() {
+        let cfg = crate::config::Config::default();
+        match build_agent(&cfg) {
+            Ok(agent) => assert_eq!(agent.name(), "claude-code"),
+            Err(e) => panic!("default config must build the claude_code agent: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn build_agent_dispatches_explicit_claude_code() {
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.backend = Some("claude_code".to_string());
+        match build_agent(&cfg) {
+            Ok(agent) => assert_eq!(agent.name(), "claude-code"),
+            Err(e) => panic!("explicit claude_code must build: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn build_agent_returns_not_implemented_for_pending_backends() {
+        // The dispatch arms exist for codex/aider/gemini today but no adapter
+        // is wired yet — they must surface a clear error rather than silently
+        // falling back to the default backend. `Box<dyn Agent>` doesn't impl
+        // Debug, so we can't use `unwrap_err` and instead match the Result
+        // explicitly.
+        for name in ["codex", "aider", "gemini"] {
+            let mut cfg = crate::config::Config::default();
+            cfg.agent.backend = Some(name.to_string());
+            match build_agent(&cfg) {
+                Ok(_) => panic!("backend {name} must error until its adapter ships"),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    assert!(
+                        msg.contains(name) && msg.contains("not yet implemented"),
+                        "expected a not-implemented error mentioning {name}, got: {msg}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_agent_rejects_unknown_backend() {
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.backend = Some("ollama".into());
+        match build_agent(&cfg) {
+            Ok(_) => panic!("unknown backend must not build"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("ollama"),
+                    "expected unknown-backend error to echo the input, got: {msg}"
+                );
+            }
+        }
     }
 }
