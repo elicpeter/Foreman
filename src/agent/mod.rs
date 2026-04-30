@@ -19,6 +19,7 @@
 //! Implementations **must** honor both the supplied `cancel`
 //! [`tokio_util::sync::CancellationToken`] and `req.timeout`.
 
+pub mod aider;
 pub mod backend;
 pub mod claude_code;
 pub mod codex;
@@ -219,9 +220,20 @@ pub fn build_agent(cfg: &crate::config::Config) -> Result<Box<dyn Agent + Send +
             }
             Ok(Box::new(agent))
         }
-        backend::BackendKind::Aider => Err(anyhow::anyhow!(
-            "backend 'aider' is not yet implemented"
-        )),
+        backend::BackendKind::Aider => {
+            let overrides = &cfg.agent.aider;
+            let mut agent = match overrides.binary.as_ref() {
+                Some(path) => aider::AiderAgent::with_binary(path),
+                None => aider::AiderAgent::new(),
+            };
+            if !overrides.extra_args.is_empty() {
+                agent = agent.with_extra_args(overrides.extra_args.clone());
+            }
+            if let Some(model) = overrides.model.as_deref() {
+                agent = agent.with_model_override(model);
+            }
+            Ok(Box::new(agent))
+        }
         backend::BackendKind::Gemini => Err(anyhow::anyhow!(
             "backend 'gemini' is not yet implemented"
         )),
@@ -281,9 +293,13 @@ mod tests {
         // than silently falling back to the default backend. `Box<dyn Agent>`
         // doesn't impl Debug, so we can't use `unwrap_err` and instead match
         // the Result explicitly. As each adapter lands its name moves out of
-        // this list (codex shipped in phase 02 — see
-        // `build_agent_dispatches_explicit_codex` below).
-        for name in ["aider", "gemini"] {
+        // this list (codex shipped in phase 02, aider in phase 03 — see
+        // `build_agent_dispatches_explicit_codex` /
+        // `build_agent_dispatches_explicit_aider` below). The list is kept as
+        // an iterable rather than a hard-coded scalar so the next adapter to
+        // land just deletes a string.
+        let pending = ["gemini"];
+        for name in pending {
             let mut cfg = crate::config::Config::default();
             cfg.agent.backend = Some(name.to_string());
             match build_agent(&cfg) {
@@ -310,6 +326,35 @@ mod tests {
         match build_agent(&cfg) {
             Ok(agent) => assert_eq!(agent.name(), "codex"),
             Err(e) => panic!("explicit codex must build: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn build_agent_dispatches_explicit_aider() {
+        // Phase 03 acceptance: setting `[agent] backend = "aider"` must build
+        // the AiderAgent adapter rather than the default Claude Code one or
+        // erroring out as a not-yet-implemented backend.
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.backend = Some("aider".to_string());
+        match build_agent(&cfg) {
+            Ok(agent) => assert_eq!(agent.name(), "aider"),
+            Err(e) => panic!("explicit aider must build: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn build_agent_aider_honors_overrides() {
+        // The `[agent.aider]` table must reach the constructed agent so
+        // tests (and real installs in non-standard locations) can point at a
+        // stub script and apply per-backend `extra_args` / `model`.
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.backend = Some("aider".to_string());
+        cfg.agent.aider.binary = Some(std::path::PathBuf::from("/tmp/fake-aider"));
+        cfg.agent.aider.extra_args = vec!["--no-auto-commits".into()];
+        cfg.agent.aider.model = Some("anthropic/sonnet-4.5".into());
+        match build_agent(&cfg) {
+            Ok(agent) => assert_eq!(agent.name(), "aider"),
+            Err(e) => panic!("aider with overrides must build: {e:#}"),
         }
     }
 
