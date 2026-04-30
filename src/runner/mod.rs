@@ -6,10 +6,13 @@
 //! transition is broadcast on a [`tokio::sync::broadcast`] channel so the CLI
 //! logger and the (later) TUI can subscribe without changing the runner.
 //!
-//! Phase 12 wires the implementer-only flow: agent → validate → tests → commit.
-//! Fixer (phase 13) and auditor (phase 14) drop in by extending [`run_phase`]
-//! with extra dispatches between "tests" and "commit"; the event channel and
-//! state shape are forward-compatible with both.
+//! Phase 12 wired the implementer-only flow: agent → validate → tests → commit.
+//! Phase 13 layers a bounded fixer loop on top: when the project tests fail,
+//! the runner dispatches the fixer agent up to
+//! [`crate::config::RetryBudgets::fixer_max_attempts`] times, re-running tests
+//! after each attempt, before halting. Auditor (phase 14) drops in next by
+//! extending the post-tests block; the event channel and state shape are
+//! forward-compatible with both.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -80,14 +83,28 @@ impl std::fmt::Display for HaltReason {
 /// best-effort: a lagging or absent subscriber never blocks the runner.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// A phase began. `attempt` starts at 1 and increments on each redispatch
-    /// (phase 13's fixer; phase 14's auditor re-run).
+    /// A phase began. Emitted once per implementer dispatch — fixer
+    /// re-dispatches inside the same phase emit [`Event::FixerStarted`] instead
+    /// so subscribers can distinguish them.
     PhaseStarted {
         /// Phase being entered.
         phase_id: PhaseId,
         /// Phase title from the heading.
         title: String,
-        /// 1-based attempt counter — total agent dispatches at this phase.
+        /// 1-based total agent dispatch counter at this phase, mirrored into
+        /// [`crate::state::RunState::attempts`]. Stays at `1` for the
+        /// implementer dispatch that fires this event.
+        attempt: u32,
+    },
+    /// The runner dispatched the fixer agent after a test failure.
+    FixerStarted {
+        /// Phase the fixer is operating on.
+        phase_id: PhaseId,
+        /// 1-based fixer attempt within this phase
+        /// (`1..=fixer_max_attempts`).
+        fixer_attempt: u32,
+        /// Total agent-dispatch counter at this phase (mirrors
+        /// [`crate::state::RunState::attempts`]).
         attempt: u32,
     },
     /// One line of agent stdout.
@@ -279,11 +296,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
             })?;
         let phase_id = phase.id.clone();
 
-        let attempt = {
-            let entry = self.state.attempts.entry(phase_id.clone()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
+        let attempt = self.bump_attempts(&phase_id);
         let _ = self.events_tx.send(Event::PhaseStarted {
             phase_id: phase_id.clone(),
             title: phase.title.clone(),
@@ -292,19 +305,6 @@ impl<A: Agent, G: Git> Runner<A, G> {
 
         let plan_path = self.workspace.join("plan.md");
         let deferred_path = self.workspace.join("deferred.md");
-
-        let plan_pre = std::fs::read(&plan_path)
-            .with_context(|| format!("runner: reading {:?}", plan_path))?;
-        let plan_hash = Snapshot::of_bytes(&plan_pre);
-        let (deferred_pre, deferred_existed) = match std::fs::read(&deferred_path) {
-            Ok(b) => (b, true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
-            Err(e) => {
-                return Err(
-                    anyhow::Error::new(e).context(format!("runner: reading {:?}", deferred_path))
-                )
-            }
-        };
 
         let user_prompt = prompts::implementer(&self.plan, &self.deferred, &phase);
         let log_path = self.attempt_log_path(&phase_id, "implementer", attempt);
@@ -318,77 +318,13 @@ impl<A: Agent, G: Git> Runner<A, G> {
             timeout: DEFAULT_AGENT_TIMEOUT,
         };
 
-        let dispatch = self.dispatch_agent(request).await?;
-
-        match &dispatch.stop_reason {
-            StopReason::Completed => {}
-            StopReason::Timeout => {
-                self.fold_token_usage(Role::Implementer, &dispatch);
-                return Ok(PhaseResult::Halted {
-                    phase_id,
-                    reason: HaltReason::AgentFailure(format!(
-                        "agent {:?} timed out after {:?}",
-                        self.agent.name(),
-                        DEFAULT_AGENT_TIMEOUT
-                    )),
-                });
-            }
-            StopReason::Cancelled => {
-                self.fold_token_usage(Role::Implementer, &dispatch);
-                return Ok(PhaseResult::Halted {
-                    phase_id,
-                    reason: HaltReason::AgentFailure(format!(
-                        "agent {:?} was cancelled",
-                        self.agent.name()
-                    )),
-                });
-            }
-            StopReason::Error(msg) => {
-                self.fold_token_usage(Role::Implementer, &dispatch);
-                return Ok(PhaseResult::Halted {
-                    phase_id,
-                    reason: HaltReason::AgentFailure(msg.clone()),
-                });
-            }
-        }
-        self.fold_token_usage(Role::Implementer, &dispatch);
-
-        let plan_post = std::fs::read(&plan_path)
-            .with_context(|| format!("runner: reading {:?} after agent", plan_path))?;
-        if Snapshot::of_bytes(&plan_post) != plan_hash {
-            warn!(phase = %phase_id, "agent modified plan.md; restoring from snapshot");
-            write_atomic(&plan_path, &plan_pre).with_context(|| {
-                format!(
-                    "runner: restoring {:?} from snapshot after tamper",
-                    plan_path
-                )
-            })?;
-            return Ok(PhaseResult::Halted {
-                phase_id,
-                reason: HaltReason::PlanTampered,
-            });
-        }
-
-        let deferred_text = match std::fs::read_to_string(&deferred_path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("runner: reading {:?} after agent", deferred_path)))
-            }
-        };
-        match deferred::parse(&deferred_text) {
-            Ok(parsed) => {
-                self.deferred = parsed;
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                warn!(phase = %phase_id, error = %msg, "deferred.md is invalid; restoring");
-                self.restore_deferred(&deferred_path, &deferred_pre, deferred_existed)?;
-                return Ok(PhaseResult::Halted {
-                    phase_id,
-                    reason: HaltReason::DeferredInvalid(msg),
-                });
+        match self
+            .dispatch_and_validate(request, Role::Implementer, &plan_path, &deferred_path)
+            .await?
+        {
+            ValidationResult::Continue => {}
+            ValidationResult::Halt(reason) => {
+                return Ok(PhaseResult::Halted { phase_id, reason })
             }
         }
 
@@ -397,21 +333,19 @@ impl<A: Agent, G: Git> Runner<A, G> {
             self.config.tests.command.as_deref(),
         );
         if let Some(runner) = test_runner {
-            let _ = self.events_tx.send(Event::TestStarted);
-            let test_log = self.attempt_log_path(&phase_id, "tests", attempt);
-            let outcome = runner
-                .run(test_log)
-                .await
-                .context("runner: running project tests")?;
-            let _ = self.events_tx.send(Event::TestFinished {
-                passed: outcome.passed,
-                summary: outcome.summary.clone(),
-            });
+            let outcome = self
+                .run_tests(&runner, &phase_id, "tests", attempt)
+                .await?;
             if !outcome.passed {
-                return Ok(PhaseResult::Halted {
-                    phase_id,
-                    reason: HaltReason::TestsFailed(outcome.summary),
-                });
+                match self
+                    .run_fixer_loop(&phase, &runner, &plan_path, &deferred_path, outcome.summary)
+                    .await?
+                {
+                    FixerLoopResult::Passed => {}
+                    FixerLoopResult::Halted(reason) => {
+                        return Ok(PhaseResult::Halted { phase_id, reason })
+                    }
+                }
             }
         } else {
             debug!("no test runner detected and no override configured; skipping tests");
@@ -482,11 +416,199 @@ impl<A: Agent, G: Git> Runner<A, G> {
             .map(|p| p.id.clone())
     }
 
+    /// Increment and return the per-phase attempt counter. The counter mirrors
+    /// every agent dispatch made for a phase (implementer + each fixer
+    /// attempt) so [`crate::state::RunState::attempts`] is the single source
+    /// of truth for "how many model dispatches did this phase consume."
+    fn bump_attempts(&mut self, phase_id: &PhaseId) -> u32 {
+        let entry = self.state.attempts.entry(phase_id.clone()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
     fn attempt_log_path(&self, phase_id: &PhaseId, role: &str, attempt: u32) -> PathBuf {
         self.workspace
             .join(".foreman")
             .join("logs")
             .join(format!("phase-{}-{}-{}.log", phase_id, role, attempt))
+    }
+
+    /// Run a single agent dispatch and validate the planning artifacts on the
+    /// way out: snapshot `plan.md` + `deferred.md` first, dispatch, then
+    /// require `plan.md` to be byte-identical and `deferred.md` to re-parse.
+    /// On any failure mode the artifacts are restored from the pre-dispatch
+    /// snapshots before returning [`ValidationResult::Halt`].
+    async fn dispatch_and_validate(
+        &mut self,
+        request: AgentRequest,
+        role: Role,
+        plan_path: &Path,
+        deferred_path: &Path,
+    ) -> Result<ValidationResult> {
+        let plan_pre = std::fs::read(plan_path)
+            .with_context(|| format!("runner: reading {:?}", plan_path))?;
+        let plan_hash = Snapshot::of_bytes(&plan_pre);
+        let (deferred_pre, deferred_existed) = match std::fs::read(deferred_path) {
+            Ok(b) => (b, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("runner: reading {:?}", deferred_path))
+                )
+            }
+        };
+
+        let dispatch = self.dispatch_agent(request).await?;
+        // Token usage is folded regardless of whether the dispatch ended
+        // cleanly — even an aborted run can incur partial spend.
+        self.fold_token_usage(role, &dispatch);
+
+        match &dispatch.stop_reason {
+            StopReason::Completed => {}
+            StopReason::Timeout => {
+                return Ok(ValidationResult::Halt(HaltReason::AgentFailure(format!(
+                    "agent {:?} timed out after {:?}",
+                    self.agent.name(),
+                    DEFAULT_AGENT_TIMEOUT
+                ))));
+            }
+            StopReason::Cancelled => {
+                return Ok(ValidationResult::Halt(HaltReason::AgentFailure(format!(
+                    "agent {:?} was cancelled",
+                    self.agent.name()
+                ))));
+            }
+            StopReason::Error(msg) => {
+                return Ok(ValidationResult::Halt(HaltReason::AgentFailure(msg.clone())));
+            }
+        }
+
+        let plan_post = std::fs::read(plan_path)
+            .with_context(|| format!("runner: reading {:?} after agent", plan_path))?;
+        if Snapshot::of_bytes(&plan_post) != plan_hash {
+            warn!(role = %role, "agent modified plan.md; restoring from snapshot");
+            write_atomic(plan_path, &plan_pre).with_context(|| {
+                format!(
+                    "runner: restoring {:?} from snapshot after tamper",
+                    plan_path
+                )
+            })?;
+            return Ok(ValidationResult::Halt(HaltReason::PlanTampered));
+        }
+
+        let deferred_text = match std::fs::read_to_string(deferred_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("runner: reading {:?} after agent", deferred_path)))
+            }
+        };
+        match deferred::parse(&deferred_text) {
+            Ok(parsed) => {
+                self.deferred = parsed;
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                warn!(role = %role, error = %msg, "deferred.md is invalid; restoring");
+                self.restore_deferred(deferred_path, &deferred_pre, deferred_existed)?;
+                return Ok(ValidationResult::Halt(HaltReason::DeferredInvalid(msg)));
+            }
+        }
+
+        Ok(ValidationResult::Continue)
+    }
+
+    /// Run the project's test suite once, emitting [`Event::TestStarted`] /
+    /// [`Event::TestFinished`] around the call. `log_role` distinguishes the
+    /// log filename so a fixer-driven re-run does not clobber the prior log.
+    async fn run_tests(
+        &self,
+        runner: &project_tests::TestRunner,
+        phase_id: &PhaseId,
+        log_role: &str,
+        attempt: u32,
+    ) -> Result<project_tests::TestOutcome> {
+        let _ = self.events_tx.send(Event::TestStarted);
+        let test_log = self.attempt_log_path(phase_id, log_role, attempt);
+        let outcome = runner
+            .run(test_log)
+            .await
+            .context("runner: running project tests")?;
+        let _ = self.events_tx.send(Event::TestFinished {
+            passed: outcome.passed,
+            summary: outcome.summary.clone(),
+        });
+        Ok(outcome)
+    }
+
+    /// Drive the bounded fixer loop after the implementer's tests fail.
+    ///
+    /// Up to [`crate::config::RetryBudgets::fixer_max_attempts`] dispatches:
+    /// each one snapshots the planning artifacts, dispatches the fixer agent,
+    /// validates, then re-runs the tests. The first attempt that produces a
+    /// passing test run resolves to [`FixerLoopResult::Passed`]; once the
+    /// budget is exhausted the loop returns the final test summary as
+    /// [`HaltReason::TestsFailed`].
+    async fn run_fixer_loop(
+        &mut self,
+        phase: &crate::plan::Phase,
+        test_runner: &project_tests::TestRunner,
+        plan_path: &Path,
+        deferred_path: &Path,
+        initial_summary: String,
+    ) -> Result<FixerLoopResult> {
+        let budget = self.config.retries.fixer_max_attempts;
+        if budget == 0 {
+            return Ok(FixerLoopResult::Halted(HaltReason::TestsFailed(
+                initial_summary,
+            )));
+        }
+
+        let phase_id = phase.id.clone();
+        let mut last_summary = initial_summary;
+
+        for fixer_attempt in 1..=budget {
+            let total_attempt = self.bump_attempts(&phase_id);
+            let _ = self.events_tx.send(Event::FixerStarted {
+                phase_id: phase_id.clone(),
+                fixer_attempt,
+                attempt: total_attempt,
+            });
+
+            let user_prompt =
+                prompts::fixer_with_deferred(&self.plan, phase, &last_summary, &self.deferred);
+            let log_path = self.attempt_log_path(&phase_id, "fix", fixer_attempt);
+            let request = AgentRequest {
+                role: Role::Fixer,
+                model: self.config.models.fixer.clone(),
+                system_prompt: String::new(),
+                user_prompt,
+                workdir: self.workspace.clone(),
+                log_path,
+                timeout: DEFAULT_AGENT_TIMEOUT,
+            };
+
+            match self
+                .dispatch_and_validate(request, Role::Fixer, plan_path, deferred_path)
+                .await?
+            {
+                ValidationResult::Continue => {}
+                ValidationResult::Halt(reason) => return Ok(FixerLoopResult::Halted(reason)),
+            }
+
+            let outcome = self
+                .run_tests(test_runner, &phase_id, "tests", total_attempt)
+                .await?;
+            if outcome.passed {
+                return Ok(FixerLoopResult::Passed);
+            }
+            last_summary = outcome.summary;
+        }
+
+        Ok(FixerLoopResult::Halted(HaltReason::TestsFailed(
+            last_summary,
+        )))
     }
 
     fn fold_token_usage(&mut self, role: Role, dispatch: &AgentDispatch) {
@@ -567,6 +689,23 @@ struct AgentDispatch {
     _role: Role,
 }
 
+/// Outcome of [`Runner::dispatch_and_validate`]. Either continue with the
+/// post-dispatch flow, or short-circuit with a halt reason already populated
+/// (snapshots restored, tokens folded).
+enum ValidationResult {
+    Continue,
+    Halt(HaltReason),
+}
+
+/// Outcome of [`Runner::run_fixer_loop`]. `Passed` means a fixer attempt
+/// produced a passing test run; `Halted` carries the reason — either an agent
+/// failure during a fixer dispatch, a planning-artifact tamper, or budget
+/// exhaustion (in which case the variant is [`HaltReason::TestsFailed`]).
+enum FixerLoopResult {
+    Passed,
+    Halted(HaltReason),
+}
+
 async fn forward_agent_events(
     mut rx: mpsc::Receiver<AgentEvent>,
     tx: broadcast::Sender<Event>,
@@ -635,6 +774,18 @@ fn log_event_line(event: &Event) {
                 phase_id = phase_id,
                 title = title,
                 attempt = attempt
+            );
+        }
+        Event::FixerStarted {
+            phase_id,
+            fixer_attempt,
+            attempt,
+        } => {
+            eprintln!(
+                "[foreman] phase {phase_id} fixer attempt {fixer_attempt} (total dispatch {attempt})",
+                phase_id = phase_id,
+                fixer_attempt = fixer_attempt,
+                attempt = attempt,
             );
         }
         Event::AgentStdout(line) => eprintln!("[agent] {line}"),

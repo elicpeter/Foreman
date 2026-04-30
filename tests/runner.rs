@@ -26,9 +26,13 @@ use foreman::agent::{Agent, AgentEvent, AgentOutcome, AgentRequest, StopReason};
 use foreman::config::Config;
 use foreman::deferred::DeferredDoc;
 use foreman::git::{Git, ShellGit};
-use foreman::plan;
+use foreman::plan::{self, PhaseId};
 use foreman::runner::{self, HaltReason, RunSummary, Runner};
 use foreman::state::TokenUsage;
+
+fn pid(s: &str) -> PhaseId {
+    PhaseId::parse(s).expect("valid phase id")
+}
 
 /// One scripted phase. Empty by default — the agent does nothing.
 #[derive(Default, Clone)]
@@ -339,6 +343,9 @@ async fn halts_on_test_failure_with_no_fixer() {
 
     let mut config = Config::default();
     config.tests.command = Some("/bin/sh -c false".to_string());
+    // Explicitly disable the fixer for this test — we want the bare phase-12
+    // "implementer fails the suite" path, not the fixer loop.
+    config.retries.fixer_max_attempts = 0;
 
     let agent = ScriptedAgent::new(vec![Script::default().write("src/lib.rs", b"// placeholder\n")]);
     let (mut runner, _g) =
@@ -359,6 +366,10 @@ async fn halts_on_test_failure_with_no_fixer() {
         log.iter().all(|l| !l.contains("[foreman] phase")),
         "no phase commits expected on test failure; got log:\n{log:?}"
     );
+
+    // attempts = 1 because no fixer dispatches were issued.
+    let state = foreman::state::load(dir.path()).unwrap().expect("state");
+    assert_eq!(state.attempts.get(&pid("01")).copied(), Some(1));
 }
 
 #[tokio::test]
@@ -450,4 +461,198 @@ async fn agent_failure_halts_with_agent_failure_reason() {
         }
         other => panic!("expected halt, got {other:?}"),
     }
+}
+
+/// Test runner script that exits 0 only when `.pass-marker` is present in the
+/// workspace. Used by the fixer integration tests to model "tests start
+/// failing, pass once the fixer creates the marker."
+const PASS_MARKER_TEST_SCRIPT: &str = "#!/bin/sh\ntest -f .pass-marker\n";
+
+#[tokio::test]
+async fn fixer_succeeds_on_attempt_2_and_phase_commits() {
+    let dir = make_workspace(ONE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+    fs::write(dir.path().join(".test.sh"), PASS_MARKER_TEST_SCRIPT).unwrap();
+
+    let mut config = Config::default();
+    config.tests.command = Some("/bin/sh ./.test.sh".to_string());
+    config.retries.fixer_max_attempts = 2;
+
+    let agent = ScriptedAgent::new(vec![
+        // Implementer: writes code but no marker → tests fail.
+        Script::default().write("src/lib.rs", b"// implementer\n"),
+        // Fixer attempt 1: still no marker → tests fail.
+        Script::default().write("src/extra.rs", b"// fixer attempt 1\n"),
+        // Fixer attempt 2: writes the marker → tests pass.
+        Script::default().write(".pass-marker", b""),
+    ]);
+
+    let (mut runner, _g) = build_runner(
+        dir.path(),
+        ONE_PHASE_PLAN,
+        EMPTY_DEFERRED,
+        config,
+        agent,
+    )
+    .await;
+
+    let summary = runner.run().await.unwrap();
+    assert!(
+        matches!(summary, RunSummary::Finished),
+        "expected finish after fixer succeeds, got {summary:?}"
+    );
+
+    // Per-attempt fixer logs land at the spec'd path.
+    let logs_dir = dir.path().join(".foreman/logs");
+    assert!(
+        logs_dir.join("phase-01-fix-1.log").exists(),
+        "phase-01-fix-1.log must exist after first fixer attempt"
+    );
+    assert!(
+        logs_dir.join("phase-01-fix-2.log").exists(),
+        "phase-01-fix-2.log must exist after second fixer attempt"
+    );
+
+    // attempts counter == 3: implementer + 2 fixer dispatches.
+    let state = foreman::state::load(dir.path()).unwrap().expect("state");
+    assert_eq!(
+        state.attempts.get(&pid("01")).copied(),
+        Some(3),
+        "attempts should reflect 1 implementer + 2 fixer dispatches"
+    );
+    assert_eq!(
+        state.completed.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        vec!["01"]
+    );
+
+    // One phase commit landed (the implementer + fixer changes are bundled).
+    let log = git_log_oneline(dir.path());
+    let phase_commits: Vec<&String> = log
+        .iter()
+        .filter(|l| l.contains("[foreman] phase"))
+        .collect();
+    assert_eq!(
+        phase_commits.len(),
+        1,
+        "expected single phase commit; got log:\n{log:?}"
+    );
+
+    // Files written by every dispatch are on disk.
+    assert!(dir.path().join("src/lib.rs").exists());
+    assert!(dir.path().join("src/extra.rs").exists());
+    assert!(dir.path().join(".pass-marker").exists());
+}
+
+#[tokio::test]
+async fn fixer_exhausts_retries_then_halts_with_tests_failed() {
+    let dir = make_workspace(ONE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+    fs::write(dir.path().join(".test.sh"), PASS_MARKER_TEST_SCRIPT).unwrap();
+
+    let mut config = Config::default();
+    config.tests.command = Some("/bin/sh ./.test.sh".to_string());
+    config.retries.fixer_max_attempts = 2;
+
+    // No script in the queue ever writes the marker, so every test run fails.
+    let agent = ScriptedAgent::new(vec![
+        Script::default().write("src/lib.rs", b"// implementer\n"),
+        Script::default().write("src/fix1.rs", b"// fixer attempt 1\n"),
+        Script::default().write("src/fix2.rs", b"// fixer attempt 2\n"),
+    ]);
+
+    let (mut runner, _g) = build_runner(
+        dir.path(),
+        ONE_PHASE_PLAN,
+        EMPTY_DEFERRED,
+        config,
+        agent,
+    )
+    .await;
+
+    let summary = runner.run().await.unwrap();
+    match summary {
+        RunSummary::Halted { phase_id, reason } => {
+            assert_eq!(phase_id.as_str(), "01");
+            assert!(
+                matches!(reason, HaltReason::TestsFailed(_)),
+                "expected TestsFailed after fixer exhaustion, got {reason:?}"
+            );
+        }
+        other => panic!("expected halt, got {other:?}"),
+    }
+
+    // Both fixer attempt logs exist even though the loop exhausted.
+    let logs_dir = dir.path().join(".foreman/logs");
+    assert!(logs_dir.join("phase-01-fix-1.log").exists());
+    assert!(logs_dir.join("phase-01-fix-2.log").exists());
+
+    // No phase commit landed.
+    let log = git_log_oneline(dir.path());
+    assert!(
+        log.iter().all(|l| !l.contains("[foreman] phase")),
+        "no phase commit expected on fixer exhaustion; got log:\n{log:?}"
+    );
+
+    // attempts counter == 3 (1 implementer + 2 fixer); phase NOT in completed.
+    let state = foreman::state::load(dir.path()).unwrap().expect("state");
+    assert_eq!(state.attempts.get(&pid("01")).copied(), Some(3));
+    assert!(
+        state.completed.is_empty(),
+        "no phase should be marked complete after a halt"
+    );
+}
+
+#[tokio::test]
+async fn fixer_emits_fixer_started_events_with_increasing_attempt() {
+    use foreman::runner::Event;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let dir = make_workspace(ONE_PHASE_PLAN, EMPTY_DEFERRED);
+    init_git_repo(dir.path());
+    fs::write(dir.path().join(".test.sh"), PASS_MARKER_TEST_SCRIPT).unwrap();
+
+    let mut config = Config::default();
+    config.tests.command = Some("/bin/sh ./.test.sh".to_string());
+    config.retries.fixer_max_attempts = 2;
+
+    let agent = ScriptedAgent::new(vec![
+        Script::default().write("src/lib.rs", b"// implementer\n"),
+        Script::default().write("src/extra.rs", b"// fixer 1\n"),
+        Script::default().write(".pass-marker", b""),
+    ]);
+
+    let (mut runner, _g) =
+        build_runner(dir.path(), ONE_PHASE_PLAN, EMPTY_DEFERRED, config, agent).await;
+    let mut rx = runner.subscribe();
+
+    let collector = tokio::spawn(async move {
+        let mut fixer_events = Vec::new();
+        loop {
+            match rx.recv().await {
+                Ok(Event::FixerStarted {
+                    phase_id,
+                    fixer_attempt,
+                    attempt,
+                }) => fixer_events.push((phase_id, fixer_attempt, attempt)),
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+        fixer_events
+    });
+
+    let summary = runner.run().await.unwrap();
+    assert!(matches!(summary, RunSummary::Finished));
+
+    drop(runner);
+    let events = collector.await.unwrap();
+    let fixer_attempts: Vec<u32> = events.iter().map(|(_, fa, _)| *fa).collect();
+    assert_eq!(fixer_attempts, vec![1, 2], "got fixer events: {events:?}");
+    let totals: Vec<u32> = events.iter().map(|(_, _, a)| *a).collect();
+    assert_eq!(
+        totals,
+        vec![2, 3],
+        "total attempt counter should be 2 then 3 (after impl=1)"
+    );
 }
