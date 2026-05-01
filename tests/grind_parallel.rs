@@ -740,7 +740,6 @@ async fn parallel_wall_clock_is_meaningfully_less_than_sum_of_session_times() {
     // overlap assertion is the real correctness gate: in a serialized
     // dispatch overlap is zero, so requiring overlap ≥ session_sleep / 2
     // already rules out the regression the elapsed bound was guarding.
-    let _ = elapsed;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

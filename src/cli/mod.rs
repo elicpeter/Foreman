@@ -122,7 +122,7 @@ pub enum Command {
         no_sweep: bool,
         /// Force a sweep before the next phase even if the configured
         /// trigger threshold isn't met. Useful after editing
-        /// `deferred.md` by hand. See `[sweep]` in `pitboss.toml` for the
+        /// `deferred.md` by hand. See `[sweep]` in `.pitboss/config.toml` for the
         /// thresholds the override bypasses.
         #[arg(long = "sweep")]
         sweep: bool,

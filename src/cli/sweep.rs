@@ -175,16 +175,26 @@ async fn execute_with_agent<A: Agent + 'static>(
         .run_standalone_sweep(after, args.max_items, state_existed)
         .await;
 
-    // Persist state.json only when a real run is in flight. The runner
-    // honors `persist_state` on its success path; we mirror that on the
-    // halt path so a halted sweep can be retried. When `state_existed`
-    // is false the synthesized state was in-memory bookkeeping only and
-    // never touches disk.
-    if state_existed {
-        if let Err(e) = state::save(&workspace, Some(runner.state())) {
-            eprintln!("[pitboss] failed to persist state.json after sweep: {e:#}");
+    let result = match outcome {
+        Ok(PhaseResult::Halted { phase_id, reason }) => {
+            // Runner persists state.json on its success path; mirror that
+            // on the halt path so a halted sweep can be retried. Skipped
+            // when `state_existed` is false: the synthesized state was
+            // in-memory bookkeeping only and must not touch disk.
+            if state_existed {
+                if let Err(e) = state::save(&workspace, Some(runner.state())) {
+                    eprintln!("[pitboss] failed to persist state.json after sweep: {e:#}");
+                }
+            }
+            eprintln!("[pitboss] sweep halted at phase {phase_id}: {reason}");
+            // The shared `ExitCode` enum's `MixedFailures` slot is the
+            // documented "exit 1 / operation failed" code; sweep reuses it
+            // here per the enum's module-level note.
+            Ok(ExitCode::MixedFailures)
         }
-    }
+        Ok(PhaseResult::Advanced { .. }) => Ok(ExitCode::Success),
+        Err(e) => Err(e),
+    };
 
     // Drop the runner so the broadcast channel closes and the logger
     // task drains. The standalone sweep doesn't emit RunFinished, so the
@@ -192,16 +202,7 @@ async fn execute_with_agent<A: Agent + 'static>(
     drop(runner);
     let _ = logger.await;
 
-    match outcome? {
-        PhaseResult::Halted { phase_id, reason } => {
-            eprintln!("[pitboss] sweep halted at phase {phase_id}: {reason}");
-            // The shared `ExitCode` enum's `MixedFailures` slot is the
-            // documented "exit 1 / operation failed" code; sweep reuses it
-            // here per the enum's module-level note.
-            Ok(ExitCode::MixedFailures)
-        }
-        PhaseResult::Advanced { .. } => Ok(ExitCode::Success),
-    }
+    result
 }
 
 const DRY_RUN_AGENT_NAME: &str = "pitboss-dry-run";
