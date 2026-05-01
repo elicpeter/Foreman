@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -45,7 +45,7 @@ use crate::state::TokenUsage;
 use crate::tests as project_tests;
 
 use super::budget::{session_cost_usd, BudgetCheck, BudgetReason, BudgetTracker};
-use super::hooks::{run_hook, HookKind};
+use super::hooks::{run_hook, HookKind, HookOutcome};
 use super::plan::{GrindPlan, Hooks, PlanBudgets};
 use super::prompt::PromptDoc;
 use super::run_dir::{RunDir, RunPaths, SessionRecord, SessionStatus};
@@ -54,6 +54,148 @@ use super::state::{build_state, RunStatus};
 use super::worktree::{
     merge_conflict_summary, merge_scratchpad_into_run, try_commit_session, SessionWorktree,
 };
+
+/// Capacity of the grind runner's event broadcast channel. Sized so a slow
+/// subscriber falls behind by a few hundred events before lagging; sends are
+/// best-effort so a missing or lagging subscriber never blocks the runner.
+pub const GRIND_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Threshold at which a budget tips into [`GrindEvent::BudgetWarning`]. Once a
+/// run-level cap is at or beyond 80% consumed, the runner emits exactly one
+/// warning per budget kind so the TUI can flash without spamming on every
+/// session record.
+const BUDGET_WARN_FRACTION: f64 = 0.80;
+
+/// Streaming events the grind runner broadcasts to subscribers. Sends are
+/// best-effort: a lagging or absent subscriber never blocks the runner.
+///
+/// Phase 13 wires this into a TUI dashboard. The plain logger keeps using
+/// `tracing` and ignores this channel.
+#[derive(Debug, Clone)]
+pub enum GrindEvent {
+    /// A session is about to dispatch its agent. Carries the seq, the prompt
+    /// name, and whether the prompt is `parallel_safe` so the dashboard can
+    /// distinguish fanned-out worktree sessions from sequential ones.
+    SessionStarted {
+        /// 1-based session sequence within the run.
+        seq: u32,
+        /// Name of the prompt being dispatched.
+        prompt: String,
+        /// Whether the dispatch took the parallel-worktree path.
+        parallel_safe: bool,
+    },
+    /// One line of agent stdout from the dispatched session.
+    AgentStdout {
+        /// Owning session sequence.
+        seq: u32,
+        /// Raw line emitted by the agent.
+        line: String,
+    },
+    /// One line of agent stderr from the dispatched session.
+    AgentStderr {
+        /// Owning session sequence.
+        seq: u32,
+        /// Raw line emitted by the agent.
+        line: String,
+    },
+    /// Agent invoked a tool inside the dispatched session.
+    AgentToolUse {
+        /// Owning session sequence.
+        seq: u32,
+        /// Tool name reported by the agent backend.
+        name: String,
+    },
+    /// A plan-level shell hook just resolved.
+    HookFired {
+        /// Owning session sequence.
+        seq: u32,
+        /// Which hook fired.
+        kind: HookKind,
+        /// Whether the hook resolved as [`HookOutcome::Success`].
+        success: bool,
+        /// One-line description of the hook outcome (passes through
+        /// [`HookOutcome::description`]).
+        description: String,
+    },
+    /// The agent's `$PITBOSS_SUMMARY_FILE` was read for this session.
+    SummaryCaptured {
+        /// Owning session sequence.
+        seq: u32,
+        /// Captured summary text.
+        summary: String,
+    },
+    /// A session resolved with a final record. Fired exactly once per
+    /// dispatched session.
+    SessionFinished {
+        /// The final session record about to be persisted.
+        record: SessionRecord,
+    },
+    /// A run-level budget reached at least 80% of its configured cap. Fired at
+    /// most once per [`BudgetWarningKind`] per run.
+    BudgetWarning {
+        /// Which budget tripped the threshold and how far it has consumed.
+        kind: BudgetWarningKind,
+    },
+    /// The scheduler's `next()` call resolved. `pick = None` means the
+    /// scheduler is exhausted (or this rotation is gated out and the runner
+    /// will exit on the next iteration).
+    SchedulerPicked {
+        /// The scheduler's rotation counter after the pick.
+        rotation: u64,
+        /// Picked prompt name, or `None` if the scheduler returned no pick.
+        pick: Option<String>,
+    },
+    /// The run loop exited. Carries the resolved [`GrindStopReason`] so the
+    /// TUI can render the final state and the same payload the CLI gets back.
+    RunFinished {
+        /// Why the loop exited.
+        stop_reason: GrindStopReason,
+    },
+}
+
+/// Which run-level budget tipped past [`BUDGET_WARN_FRACTION`]. Carries the
+/// observed counter and the configured cap so the TUI can render the percent
+/// without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BudgetWarningKind {
+    /// `max_iterations` is at >=80% of cap.
+    Iterations {
+        /// Sessions dispatched so far.
+        used: u32,
+        /// Configured cap.
+        cap: u32,
+    },
+    /// `max_tokens` is at >=80% of cap.
+    Tokens {
+        /// Cumulative tokens (input + output) so far.
+        used: u64,
+        /// Configured cap.
+        cap: u64,
+    },
+    /// `max_cost_usd` is at >=80% of cap.
+    Cost {
+        /// Cumulative cost in USD so far.
+        used: f64,
+        /// Configured cap.
+        cap: f64,
+    },
+    /// Wall clock has consumed >=80% of the (`started_at`, `until`) window.
+    Until {
+        /// Seconds elapsed since the run started.
+        elapsed_secs: i64,
+        /// Total seconds in the budget window.
+        window_secs: i64,
+    },
+}
+
+/// Per-budget bookkeeping so the runner emits exactly one warning per kind.
+#[derive(Debug, Default)]
+struct BudgetWarnFlags {
+    iterations: bool,
+    tokens: bool,
+    cost: bool,
+    until: bool,
+}
 
 /// Raw markdown standing-instruction block prepended to every grind prompt.
 /// Embedded at compile time so users do not have to author it themselves and
@@ -231,6 +373,11 @@ pub struct GrindRunner<A: Agent, G: Git> {
     /// for the duration of their commit step so a parallel session waiting
     /// on the run branch can't interleave.
     run_branch_lock: Arc<TokioMutex<()>>,
+    /// Broadcast channel for [`GrindEvent`]s. Subscribers (the TUI) attach
+    /// via [`GrindRunner::subscribe`]; the runner keeps the sender so
+    /// post-run lookups can still emit events without re-creating the
+    /// channel.
+    events_tx: broadcast::Sender<GrindEvent>,
 }
 
 impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
@@ -259,6 +406,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
         consecutive_failure_limit: u32,
     ) -> Self {
         let scheduler = Scheduler::new(plan.clone(), prompts);
+        let (events_tx, _) = broadcast::channel(GRIND_EVENT_CHANNEL_CAPACITY);
         Self {
             workspace,
             config: Arc::new(config),
@@ -275,6 +423,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             started_at: Utc::now(),
             initial_budget: super::budget::BudgetSnapshot::default(),
             run_branch_lock: Arc::new(TokioMutex::new(())),
+            events_tx,
         }
     }
 
@@ -306,6 +455,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
         started_at: DateTime<Utc>,
     ) -> Self {
         let scheduler = Scheduler::with_state(plan.clone(), prompts, scheduler_state);
+        let (events_tx, _) = broadcast::channel(GRIND_EVENT_CHANNEL_CAPACITY);
         Self {
             workspace,
             config: Arc::new(config),
@@ -322,6 +472,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             started_at,
             initial_budget,
             run_branch_lock: Arc::new(TokioMutex::new(())),
+            events_tx,
         }
     }
 
@@ -351,6 +502,26 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
         self.started_at
     }
 
+    /// Borrow the run-wide budgets (resolved from `pitboss.toml`, plan, and
+    /// CLI flags before the runner was built). The TUI footer reads this for
+    /// the budget headers.
+    pub fn budgets(&self) -> &PlanBudgets {
+        &self.budgets
+    }
+
+    /// Borrow the dispatching agent. The TUI uses this for [`Agent::name`].
+    pub fn agent(&self) -> &A {
+        self.agent.as_ref()
+    }
+
+    /// Subscribe to the runner's [`GrindEvent`] stream. Returns a fresh
+    /// receiver each call; existing subscribers are unaffected. Lagging
+    /// subscribers see [`broadcast::error::RecvError::Lagged`] and miss
+    /// intermediate events — they never block the runner.
+    pub fn subscribe(&self) -> broadcast::Receiver<GrindEvent> {
+        self.events_tx.subscribe()
+    }
+
     /// Drive the loop. Returns once the scheduler exhausts, drain trips,
     /// abort trips, a run-level budget exhausts, or the consecutive-failure
     /// limit is reached.
@@ -366,6 +537,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
         let semaphore = Arc::new(Semaphore::new(max_parallel as usize));
         let mut tasks: JoinSet<Result<SessionRecord>> = JoinSet::new();
         let mut max_completed_seq: u32 = self.next_seq.saturating_sub(1);
+        let mut warn_flags = BudgetWarnFlags::default();
 
         // Stamp the initial state.json so a resume target exists from the
         // first moment a run is on disk, even if the host process dies before
@@ -413,7 +585,12 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
                 break;
             }
 
-            let Some(prompt) = self.scheduler.next() else {
+            let pick = self.scheduler.next();
+            let _ = self.events_tx.send(GrindEvent::SchedulerPicked {
+                rotation: self.scheduler.state().rotation,
+                pick: pick.as_ref().map(|p| p.meta.name.clone()),
+            });
+            let Some(prompt) = pick else {
                 break;
             };
 
@@ -436,6 +613,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
                     &mut sessions,
                     &mut tracker,
                     &mut max_completed_seq,
+                    &mut warn_flags,
                     &shutdown,
                 )
                 .await?;
@@ -483,6 +661,12 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
                 "grind: dispatching session"
             );
 
+            let _ = self.events_tx.send(GrindEvent::SessionStarted {
+                seq,
+                prompt: prompt.meta.name.clone(),
+                parallel_safe: prompt.meta.parallel_safe,
+            });
+
             let input = self
                 .prepare_session_input(seq, prompt, permit, &shutdown)
                 .await
@@ -498,6 +682,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
                     &mut sessions,
                     &mut tracker,
                     &mut max_completed_seq,
+                    &mut warn_flags,
                 )?,
                 Ok(Err(e)) => return Err(e),
                 Err(je) => {
@@ -529,6 +714,9 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             );
         }
 
+        let _ = self.events_tx.send(GrindEvent::RunFinished {
+            stop_reason: stop_reason.clone(),
+        });
         Ok(GrindRunOutcome {
             run_id: self.run_id.clone(),
             branch: self.branch.clone(),
@@ -549,6 +737,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
         sessions: &mut Vec<SessionRecord>,
         tracker: &mut BudgetTracker,
         max_completed_seq: &mut u32,
+        warn_flags: &mut BudgetWarnFlags,
         shutdown: &GrindShutdown,
     ) -> Result<AcquireOutcome> {
         loop {
@@ -574,7 +763,13 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             };
             match res {
                 Ok(Ok(rec)) => {
-                    self.handle_completion(rec, sessions, tracker, max_completed_seq)?
+                    self.handle_completion(
+                        rec,
+                        sessions,
+                        tracker,
+                        max_completed_seq,
+                        warn_flags,
+                    )?
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(je) => return Err(anyhow::anyhow!("session task panicked: {je}")),
@@ -595,6 +790,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
         sessions: &mut Vec<SessionRecord>,
         tracker: &mut BudgetTracker,
         max_completed_seq: &mut u32,
+        warn_flags: &mut BudgetWarnFlags,
     ) -> Result<()> {
         let seq = record.seq;
         self.run_dir
@@ -602,10 +798,14 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             .append(&record)
             .with_context(|| format!("grind: appending session {seq} record to log"))?;
         tracker.record_session(&record);
+        let _ = self
+            .events_tx
+            .send(GrindEvent::SessionFinished { record: record.clone() });
         if seq > *max_completed_seq {
             *max_completed_seq = seq;
         }
         sessions.push(record);
+        self.emit_budget_warnings(tracker, warn_flags, Utc::now());
         if let Err(e) = self.write_state(tracker, *max_completed_seq, RunStatus::Active) {
             warn!(
                 run_id = %self.run_id,
@@ -615,6 +815,67 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             );
         }
         Ok(())
+    }
+
+    /// Emit a [`GrindEvent::BudgetWarning`] for each configured budget that
+    /// just crossed [`BUDGET_WARN_FRACTION`]. Pure on `tracker` and
+    /// `warn_flags`; idempotent — once a flag is set the runner never re-emits
+    /// for that budget.
+    fn emit_budget_warnings(
+        &self,
+        tracker: &BudgetTracker,
+        flags: &mut BudgetWarnFlags,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(cap) = self.budgets.max_iterations {
+            if !flags.iterations
+                && cap > 0
+                && fraction_used_u64(u64::from(tracker.iterations()), u64::from(cap))
+                    >= BUDGET_WARN_FRACTION
+            {
+                flags.iterations = true;
+                let _ = self.events_tx.send(GrindEvent::BudgetWarning {
+                    kind: BudgetWarningKind::Iterations {
+                        used: tracker.iterations(),
+                        cap,
+                    },
+                });
+            }
+        }
+        if let Some(cap) = self.budgets.max_tokens {
+            let used = tracker.total_tokens();
+            if !flags.tokens && cap > 0 && fraction_used_u64(used, cap) >= BUDGET_WARN_FRACTION {
+                flags.tokens = true;
+                let _ = self.events_tx.send(GrindEvent::BudgetWarning {
+                    kind: BudgetWarningKind::Tokens { used, cap },
+                });
+            }
+        }
+        if let Some(cap) = self.budgets.max_cost_usd {
+            let used = tracker.total_cost_usd();
+            if !flags.cost && cap > 0.0 && (used / cap) >= BUDGET_WARN_FRACTION {
+                flags.cost = true;
+                let _ = self.events_tx.send(GrindEvent::BudgetWarning {
+                    kind: BudgetWarningKind::Cost { used, cap },
+                });
+            }
+        }
+        if let Some(until) = self.budgets.until {
+            let window = (until - self.started_at).num_seconds();
+            let elapsed = (now - self.started_at).num_seconds();
+            if !flags.until && window > 0 {
+                let frac = (elapsed as f64) / (window as f64);
+                if frac >= BUDGET_WARN_FRACTION {
+                    flags.until = true;
+                    let _ = self.events_tx.send(GrindEvent::BudgetWarning {
+                        kind: BudgetWarningKind::Until {
+                            elapsed_secs: elapsed,
+                            window_secs: window,
+                        },
+                    });
+                }
+            }
+        }
     }
 
     async fn prepare_session_input(
@@ -711,6 +972,7 @@ impl<A: Agent + 'static, G: Git + 'static> GrindRunner<A, G> {
             session_log_tail,
             scratchpad_seed,
             base_env,
+            events_tx: self.events_tx.clone(),
         })
     }
 
@@ -793,6 +1055,9 @@ struct SessionTaskInput<A: Agent, G: Git> {
     /// scratchpad merge in parallel mode.
     scratchpad_seed: String,
     base_env: HashMap<String, String>,
+    /// Broadcast handle the session uses to publish [`GrindEvent`]s as the
+    /// dispatch progresses. Cloned from the runner at task spawn.
+    events_tx: broadcast::Sender<GrindEvent>,
 }
 
 /// Body of one dispatched session. Returns the resulting [`SessionRecord`];
@@ -821,6 +1086,7 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
         session_log_tail,
         scratchpad_seed,
         base_env,
+        events_tx,
     } = input;
 
     let started_at = Utc::now();
@@ -843,6 +1109,7 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
             &hook_passthrough,
         )
         .await;
+        emit_hook_event(&events_tx, seq, HookKind::PreSession, &outcome);
         if !outcome.is_success() {
             warn!(
                 run_id = %run_id,
@@ -894,7 +1161,12 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
         let mut summary_override: Option<String> = None;
         let dispatch = match tokio::time::timeout(
             timeout,
-            dispatch_agent(&*agent, request, shutdown.cancel_token()),
+            dispatch_agent_with_events(
+                &*agent,
+                request,
+                shutdown.cancel_token(),
+                Some((events_tx.clone(), seq)),
+            ),
         )
         .await
         {
@@ -954,6 +1226,10 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
             Some(s) => s,
             None => read_summary_or_fallback(&summary_path),
         };
+        let _ = events_tx.send(GrindEvent::SummaryCaptured {
+            seq,
+            summary: summary.clone(),
+        });
 
         let mut verify_extra_tokens = TokenUsage::default();
         if status == SessionStatus::Ok && prompt.meta.verify {
@@ -1119,7 +1395,7 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
         hook_env.insert("PITBOSS_SESSION_STATUS".into(), status.as_str().to_string());
         hook_env.insert("PITBOSS_SESSION_SUMMARY".into(), summary.clone());
         if let Some(cmd) = plan_hooks.post_session.as_deref() {
-            let _ = run_hook(
+            let outcome = run_hook(
                 HookKind::PostSession,
                 cmd,
                 &hook_env,
@@ -1128,10 +1404,11 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
                 &hook_passthrough,
             )
             .await;
+            emit_hook_event(&events_tx, seq, HookKind::PostSession, &outcome);
         }
         if status != SessionStatus::Ok {
             if let Some(cmd) = plan_hooks.on_failure.as_deref() {
-                let _ = run_hook(
+                let outcome = run_hook(
                     HookKind::OnFailure,
                     cmd,
                     &hook_env,
@@ -1140,6 +1417,7 @@ async fn run_session_task<A: Agent + 'static, G: Git + 'static>(
                     &hook_passthrough,
                 )
                 .await;
+                emit_hook_event(&events_tx, seq, HookKind::OnFailure, &outcome);
             }
         }
     }
@@ -1402,12 +1680,43 @@ async fn dispatch_agent<A: Agent + ?Sized>(
     request: AgentRequest,
     cancel: &CancellationToken,
 ) -> Result<AgentDispatch> {
+    dispatch_agent_with_events(agent, request, cancel, None).await
+}
+
+/// Variant of [`dispatch_agent`] that forwards each [`AgentEvent`] to the
+/// runner's broadcast channel as a [`GrindEvent`]. The implementer dispatch
+/// inside [`run_session_task`] threads the seq + sender through here; the
+/// fixer-loop dispatches in [`verify_with_fixer_loop`] keep using the
+/// no-forward variant since the TUI's right pane reflects the originating
+/// session's transcript regardless of which sub-dispatch produced a line.
+async fn dispatch_agent_with_events<A: Agent + ?Sized>(
+    agent: &A,
+    request: AgentRequest,
+    cancel: &CancellationToken,
+    forward: Option<(broadcast::Sender<GrindEvent>, u32)>,
+) -> Result<AgentDispatch> {
     let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
     let cancel_clone = cancel.clone();
     let drain_task = tokio::spawn(async move {
-        while events_rx.recv().await.is_some() {
-            // Phase 13 wires these into the TUI; for now we drop them so
-            // the channel doesn't apply backpressure on the agent.
+        while let Some(ev) = events_rx.recv().await {
+            let Some((sender, seq)) = forward.as_ref() else {
+                continue;
+            };
+            match ev {
+                AgentEvent::Stdout(line) => {
+                    let _ = sender.send(GrindEvent::AgentStdout { seq: *seq, line });
+                }
+                AgentEvent::Stderr(line) => {
+                    let _ = sender.send(GrindEvent::AgentStderr { seq: *seq, line });
+                }
+                AgentEvent::ToolUse(name) => {
+                    let _ = sender.send(GrindEvent::AgentToolUse { seq: *seq, name });
+                }
+                AgentEvent::TokenDelta(_) => {
+                    // Token deltas are folded from the dispatch outcome; the
+                    // TUI does not surface intermediate deltas.
+                }
+            }
         }
     });
 
@@ -1421,6 +1730,34 @@ async fn dispatch_agent<A: Agent + ?Sized>(
         stop_reason: outcome.stop_reason,
         tokens: outcome.tokens,
     })
+}
+
+/// Forward a hook outcome onto the runner's event broadcast. Errors from a
+/// closed broadcast channel are swallowed — the runner keeps running even
+/// when no subscriber is attached.
+fn emit_hook_event(
+    events_tx: &broadcast::Sender<GrindEvent>,
+    seq: u32,
+    kind: HookKind,
+    outcome: &HookOutcome,
+) {
+    let _ = events_tx.send(GrindEvent::HookFired {
+        seq,
+        kind,
+        success: outcome.is_success(),
+        description: outcome.description(),
+    });
+}
+
+/// `f64` quotient with a zero-cap guard. Used by the budget-warning emission
+/// to avoid `0/0` when a cap is unset (already filtered upstream) or when the
+/// counter and cap are both zero.
+fn fraction_used_u64(used: u64, cap: u64) -> f64 {
+    if cap == 0 {
+        0.0
+    } else {
+        used as f64 / cap as f64
+    }
 }
 
 struct AgentDispatch {

@@ -14,6 +14,7 @@
 //! even on panic or early return.
 
 mod app;
+pub mod grind;
 
 pub use app::{Activity, AgentDisplay, App, PhaseStatus, UsageView, OUTPUT_BUFFER_LINES};
 
@@ -174,13 +175,13 @@ enum UserOutcome {
 /// The explicit [`Self::restore`] path surfaces teardown errors when nothing
 /// else has gone wrong; the `Drop` path swallows them because we cannot
 /// usefully report errors during unwinding.
-struct TerminalGuard {
+pub(crate) struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     active: bool,
 }
 
 impl TerminalGuard {
-    fn setup() -> Result<Self> {
+    pub(crate) fn setup() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
@@ -201,11 +202,11 @@ impl TerminalGuard {
         }
     }
 
-    fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
+    pub(crate) fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
         &mut self.terminal
     }
 
-    fn restore(&mut self) -> Result<()> {
+    pub(crate) fn restore(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
@@ -239,7 +240,7 @@ impl Drop for TerminalGuard {
 
 /// Frame interval. Aggressive enough for streaming agent output to feel
 /// live; loose enough not to thrash the terminal when nothing is happening.
-const TICK_INTERVAL: Duration = Duration::from_millis(80);
+pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(80);
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,

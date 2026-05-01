@@ -45,7 +45,8 @@ pub use prompt::{
 };
 pub use run::{
     compose_user_prompt, render_grind_fixer_prompt, run_branch_name, standing_instruction_block,
-    GrindRunOutcome, GrindRunner, GrindShutdown, GrindStopReason,
+    BudgetWarningKind, GrindEvent, GrindRunOutcome, GrindRunner, GrindShutdown, GrindStopReason,
+    GRIND_EVENT_CHANNEL_CAPACITY,
 };
 pub use run_dir::{
     generate_run_id, render_sessions_md, RunDir, RunPaths, Scratchpad, SessionLog, SessionRecord,

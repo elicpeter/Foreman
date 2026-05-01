@@ -29,10 +29,11 @@ use crate::grind::{
     default_plan_from_dir, discover_prompts, generate_run_id, load_plan, reconstruct_state_from_log,
     render_dry_run_report, resolve_budgets, resolve_target, run_branch_name,
     sweep_stale_session_worktrees as pitboss_grind_sweep, validate_resume, DiscoveryOptions,
-    DryRunInputs, ExitCode, GrindPlan, GrindRunner, GrindShutdown, GrindStopReason, PlanBudgets,
-    PromptDoc, ResumeError, RunDir, RunListing, SessionRecord, SessionStatus,
+    DryRunInputs, ExitCode, GrindPlan, GrindRunOutcome, GrindRunner, GrindShutdown, GrindStopReason,
+    PlanBudgets, PromptDoc, ResumeError, RunDir, RunListing, SessionRecord, SessionStatus,
 };
 use crate::style::{self, col};
+use crate::tui;
 
 /// `pitboss grind [options]` argument surface.
 #[derive(Debug, Args)]
@@ -96,6 +97,13 @@ pub struct GrindArgs {
     /// scheduler.
     #[arg(long = "resume", value_name = "RUN_ID", num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
+    /// Render a live `ratatui` dashboard instead of the plain logger.
+    /// Mirrors `pitboss play --tui`. The dashboard subscribes to the runner's
+    /// [`crate::grind::GrindEvent`] stream and updates per session start,
+    /// agent output, hook fires, summary captures, budget warnings, and
+    /// scheduler picks.
+    #[arg(long)]
+    pub tui: bool,
 }
 
 /// Help-epilog table. Mirrors `crate::grind::ExitCode` so users can map a
@@ -344,12 +352,17 @@ where
 
     announce_start(&run_id, &branch);
 
-    let result = runner.run(shutdown.clone()).await;
+    let outcome = drive_runner(&mut runner, args.tui, shutdown.clone()).await?;
 
     signal_task.abort();
     let _ = signal_task.await;
 
-    let outcome = result?;
+    let Some(outcome) = outcome else {
+        // User quit the TUI before the runner produced an outcome. The TUI
+        // tripped the drain signal on its way out; treat this as an aborted
+        // session-less run for exit-code purposes.
+        return Ok(ExitCode::Aborted);
+    };
     announce_finish(
         &outcome.run_id,
         &outcome.branch,
@@ -360,6 +373,25 @@ where
     let exit = classify_outcome(&outcome.stop_reason, &outcome.sessions);
     let exit = maybe_open_pr(&workspace, &outcome.run_id, &plan_name, args, exit).await;
     Ok(exit)
+}
+
+/// Drive a [`GrindRunner`] either with the plain logger (default) or the
+/// `ratatui` dashboard (when `--tui` is set). Returns `None` only when the
+/// TUI exited before the runner produced an outcome (user pressed
+/// `q`/`a`/Ctrl-C); the logger path always returns `Some`.
+async fn drive_runner<A>(
+    runner: &mut GrindRunner<A, crate::git::ShellGit>,
+    tui_flag: bool,
+    shutdown: GrindShutdown,
+) -> Result<Option<GrindRunOutcome>>
+where
+    A: crate::agent::Agent + Send + Sync + 'static,
+{
+    if tui_flag {
+        Ok(tui::grind::run(runner, shutdown).await?)
+    } else {
+        Ok(Some(runner.run(shutdown).await?))
+    }
 }
 
 async fn execute_resume<A>(
@@ -533,12 +565,14 @@ where
 
     announce_resume(&run_id, &state.branch, reconciled.last_session_seq);
 
-    let result = runner.run(shutdown.clone()).await;
+    let outcome = drive_runner(&mut runner, args.tui, shutdown.clone()).await?;
 
     signal_task.abort();
     let _ = signal_task.await;
 
-    let outcome = result?;
+    let Some(outcome) = outcome else {
+        return Ok(ExitCode::Aborted);
+    };
     announce_finish(
         &outcome.run_id,
         &outcome.branch,
