@@ -116,6 +116,19 @@ pub struct RunState {
     /// `pitboss init` after removing it) to start over.
     #[serde(default)]
     pub aborted: bool,
+    /// `true` when a deferred-sweep dispatch is owed before the next regular
+    /// phase runs. Set at the end of a phase that left the deferred file above
+    /// the configured threshold; cleared once the sweep dispatch resolves
+    /// (success or trigger no longer fires). Persists across resumes so a halt
+    /// during a sweep retries the sweep, not the phase that follows.
+    #[serde(default)]
+    pub pending_sweep: bool,
+    /// Number of sweep dispatches the runner has chained without an
+    /// intervening real phase commit. Resets to zero on every successful phase
+    /// commit so [`crate::config::SweepConfig::max_consecutive`] re-arms after
+    /// each forward step.
+    #[serde(default)]
+    pub consecutive_sweeps: u32,
 }
 
 impl RunState {
@@ -135,6 +148,8 @@ impl RunState {
             attempts: HashMap::new(),
             token_usage: TokenUsage::default(),
             aborted: false,
+            pending_sweep: false,
+            consecutive_sweeps: 0,
         }
     }
 }
@@ -185,6 +200,8 @@ mod tests {
                 by_role,
             },
             aborted: false,
+            pending_sweep: false,
+            consecutive_sweeps: 0,
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -194,9 +211,10 @@ mod tests {
 
     #[test]
     fn deserializes_legacy_state_without_new_fields() {
-        // Older state.json files predate `original_branch` and `aborted`.
-        // Both must default cleanly so a workspace started under an earlier
-        // pitboss build resumes under this one without manual surgery.
+        // Older state.json files predate `original_branch`, `aborted`,
+        // `pending_sweep`, and `consecutive_sweeps`. All must default cleanly
+        // so a workspace started under an earlier pitboss build resumes under
+        // this one without manual surgery.
         let legacy = serde_json::json!({
             "run_id": "rid",
             "branch": "br",
@@ -209,6 +227,8 @@ mod tests {
         let state: RunState = serde_json::from_value(legacy).unwrap();
         assert_eq!(state.original_branch, None);
         assert!(!state.aborted);
+        assert!(!state.pending_sweep);
+        assert_eq!(state.consecutive_sweeps, 0);
     }
 
     #[test]

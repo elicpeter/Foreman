@@ -233,6 +233,8 @@ mod tests {
                 by_role,
             },
             aborted: false,
+            pending_sweep: false,
+            consecutive_sweeps: 0,
         }
     }
 

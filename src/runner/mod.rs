@@ -18,6 +18,7 @@
 
 pub mod sweep;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -208,6 +209,42 @@ pub enum Event {
     /// subscribers can show running cost / token totals without needing a
     /// reference to the runner state.
     UsageUpdated(crate::state::TokenUsage),
+    /// A deferred-sweep dispatch began. Fires once per sweep step, between
+    /// the [`Event::PhaseCommitted`] of the preceding phase and the
+    /// [`Event::PhaseStarted`] of the next regular phase. The sweep does not
+    /// introduce a synthetic phase id — `after` is the most recently completed
+    /// phase under which the sweep's attempts are accounted.
+    SweepStarted {
+        /// Phase the sweep is firing after.
+        after: PhaseId,
+        /// Unchecked-item count observed before the sweep dispatched.
+        items_pending: usize,
+        /// Total agent-dispatch counter under `after` after the sweep's
+        /// implementer dispatch is recorded.
+        attempt: u32,
+    },
+    /// A deferred-sweep dispatch finished and its commit (or empty diff) has
+    /// landed. `commit` is `None` when the sweep produced no code changes.
+    SweepCompleted {
+        /// Phase the sweep fired after.
+        after: PhaseId,
+        /// Number of `## Deferred items` entries the sweep flipped from
+        /// `- [ ]` to `- [x]` (and which the post-sweep `DeferredDoc::sweep`
+        /// then dropped). New items the agent appended don't pollute this
+        /// count.
+        resolved: usize,
+        /// Resulting commit, or `None` for the no-code-changes case.
+        commit: Option<CommitId>,
+    },
+    /// A deferred-sweep dispatch halted before it could land a commit. Mirrors
+    /// [`Event::PhaseHalted`] for the sweep entry point so subscribers can
+    /// distinguish "phase failed" from "sweep failed."
+    SweepHalted {
+        /// Phase the sweep fired after.
+        after: PhaseId,
+        /// Why the sweep halted.
+        reason: HaltReason,
+    },
 }
 
 /// Outcome of [`Runner::run_phase`].
@@ -399,6 +436,45 @@ impl<A: Agent, G: Git> Runner<A, G> {
     }
 
     async fn run_phase_inner(&mut self) -> Result<PhaseResult> {
+        // Pending sweep gate. A regular phase that closed above the trigger
+        // threshold sets `state.pending_sweep = true`; we re-evaluate the
+        // trigger here against the current on-disk deferred so a manual
+        // cleanup between resumes (the user clearing items by hand) drains
+        // the obligation cleanly rather than firing a no-op sweep.
+        if self.state.pending_sweep {
+            // Re-read from disk so external edits between resumes are
+            // observed, not just the cached `self.deferred`.
+            let deferred_path = paths::deferred_path(&self.workspace);
+            let on_disk = match std::fs::read_to_string(&deferred_path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("runner: reading {:?}", &deferred_path)))
+                }
+            };
+            let parsed = deferred::parse(&on_disk).unwrap_or_else(|_| self.deferred.clone());
+            if sweep::should_run_deferred_sweep(
+                &parsed,
+                &self.config.sweep,
+                self.state.consecutive_sweeps,
+            ) {
+                self.deferred = parsed;
+                let after = self
+                    .state
+                    .completed
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("pending_sweep set but no completed phase"))?;
+                return self.run_sweep_step(after).await;
+            } else {
+                self.state.pending_sweep = false;
+                state::save(&self.workspace, Some(&self.state))
+                    .context("runner: persisting state.json after sweep gate cleared")?;
+                self.deferred = parsed;
+            }
+        }
+
         let phase = self
             .plan
             .phase(&self.plan.current_phase)
@@ -465,12 +541,25 @@ impl<A: Agent, G: Git> Runner<A, G> {
             .context("runner: writing deferred.md after sweep")?;
 
         self.state.completed.push(phase_id.clone());
+        // Forward step → re-arm the consecutive-sweep clamp so the next
+        // pending sweep is allowed to fire.
+        self.state.consecutive_sweeps = 0;
 
         let next_phase = self.next_phase_id_after(&phase_id);
         if let Some(ref next) = next_phase {
             self.plan.set_current_phase(next.clone());
             write_atomic(&plan_path, plan::serialize(&self.plan).as_bytes())
                 .context("runner: writing plan.md with advanced current_phase")?;
+            // Only consider scheduling a between-phase sweep when there is a
+            // next phase to insert it before. End-of-run sweeps (after the
+            // final phase) belong to phase 08.
+            if sweep::should_run_deferred_sweep(
+                &self.deferred,
+                &self.config.sweep,
+                self.state.consecutive_sweeps,
+            ) {
+                self.state.pending_sweep = true;
+            }
         }
 
         state::save(&self.workspace, Some(&self.state)).context("runner: persisting state.json")?;
@@ -649,6 +738,174 @@ impl<A: Agent, G: Git> Runner<A, G> {
     fn attempt_log_path(&self, phase_id: &PhaseId, role: &str, attempt: u32) -> PathBuf {
         paths::play_logs_dir(&self.workspace)
             .join(format!("phase-{}-{}-{}.log", phase_id, role, attempt))
+    }
+
+    /// Per-attempt log path for a sweep dispatch. Distinct prefix from
+    /// [`Runner::attempt_log_path`] so an operator scanning `.pitboss/play/logs/`
+    /// can tell sweep dispatches apart from regular phase dispatches at a
+    /// glance even though both account against `state.attempts[after]`.
+    fn sweep_log_path(&self, after: &PhaseId, role: &str, attempt: u32) -> PathBuf {
+        paths::play_logs_dir(&self.workspace)
+            .join(format!("sweep-after-{}-{}-{}.log", after, role, attempt))
+    }
+
+    /// Run a deferred-sweep dispatch between two regular phases.
+    ///
+    /// The sweep reuses [`Runner::run_dispatch_pipeline`] with `phase: None`
+    /// and `audit: None` (phase 04 turns the auditor back on with a sweep-
+    /// specific prompt). The implementer's prompt is built via
+    /// [`prompts::sweep`]; if tests fail post-dispatch the fixer falls back to
+    /// [`prompts::fixer_for_sweep`] inside the pipeline. `state.attempts` is
+    /// keyed under `after` (the most recently completed real phase) so
+    /// sweep dispatches share the same attempts budget as the phase they
+    /// follow.
+    async fn run_sweep_step(&mut self, after: PhaseId) -> Result<PhaseResult> {
+        // Capture pre-sweep accounting. `pre_texts` is unused in this phase;
+        // phase 05's staleness tracker reads it from a similar capture point.
+        let pre_unchecked = sweep::unchecked_count(&self.deferred);
+        let _pre_texts: HashSet<String> = self
+            .deferred
+            .items
+            .iter()
+            .filter(|i| !i.done)
+            .map(|i| i.text.clone())
+            .collect();
+        // Snapshot the H3 phases block. The sweep prompt forbids touching
+        // `## Deferred phases`; a mismatch on the way out trips the
+        // DeferredInvalid guard.
+        let pre_phases = phases_block_canonical(&self.deferred);
+
+        let plan_path = paths::plan_path(&self.workspace);
+        let deferred_path = paths::deferred_path(&self.workspace);
+        let pre_deferred_bytes = match std::fs::read(&deferred_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("runner: reading {:?} before sweep", &deferred_path)))
+            }
+        };
+
+        if let Some(reason) = self.check_budget() {
+            return Ok(PhaseResult::Halted {
+                phase_id: after,
+                reason,
+            });
+        }
+
+        let attempt = self.bump_attempts(&after);
+        let _ = self.events_tx.send(Event::SweepStarted {
+            after: after.clone(),
+            items_pending: pre_unchecked,
+            attempt,
+        });
+
+        let request = AgentRequest {
+            role: Role::Implementer,
+            model: self.config.models.implementer.clone(),
+            system_prompt: prompts::caveman::system_prompt(&self.config.caveman),
+            user_prompt: prompts::sweep(&self.plan, &self.deferred, Some(&after), &[]),
+            workdir: self.workspace.clone(),
+            log_path: self.sweep_log_path(&after, "implementer", attempt),
+            timeout: DEFAULT_AGENT_TIMEOUT,
+            env: std::collections::HashMap::new(),
+        };
+
+        let exclude: [&Path; 1] = [Path::new(".pitboss")];
+        let spec = DispatchSpec {
+            request,
+            phase_id: after.clone(),
+            phase: None,
+            plan_path: &plan_path,
+            deferred_path: &deferred_path,
+            exclude_paths: &exclude,
+            audit: None,
+        };
+
+        let has_changes = match self.run_dispatch_pipeline(spec).await? {
+            PipelineOutcome::Halted(reason) => {
+                let _ = self.events_tx.send(Event::SweepHalted {
+                    after: after.clone(),
+                    reason: reason.clone(),
+                });
+                return Ok(PhaseResult::Halted {
+                    phase_id: after,
+                    reason,
+                });
+            }
+            PipelineOutcome::Staged { has_changes } => has_changes,
+        };
+
+        // H3 invariant: the sweep prompt forbids editing `## Deferred phases`.
+        // Restore from the pre-dispatch deferred snapshot when violated so the
+        // halt is genuinely recoverable.
+        let post_phases = phases_block_canonical(&self.deferred);
+        if post_phases != pre_phases {
+            warn!(
+                after = %after,
+                "sweep modified ## Deferred phases; restoring deferred.md"
+            );
+            self.restore_deferred(&deferred_path, &pre_deferred_bytes, true)?;
+            // Re-parse the restored bytes so the cached doc agrees with disk.
+            let restored = std::fs::read_to_string(&deferred_path).unwrap_or_default();
+            if let Ok(parsed) = deferred::parse(&restored) {
+                self.deferred = parsed;
+            }
+            let reason = HaltReason::DeferredInvalid("sweep modified Deferred phases".into());
+            let _ = self.events_tx.send(Event::SweepHalted {
+                after: after.clone(),
+                reason: reason.clone(),
+            });
+            return Ok(PhaseResult::Halted {
+                phase_id: after,
+                reason,
+            });
+        }
+
+        // `resolved` counts items the sweep flipped from `- [ ]` to `- [x]`.
+        // `saturating_sub` keeps new items the agent appended (against the
+        // prompt's instruction) from polluting the count into a negative.
+        let resolved = pre_unchecked.saturating_sub(sweep::unchecked_count(&self.deferred));
+
+        let commit = if has_changes {
+            let id = self
+                .git
+                .commit(&git::commit_message_sweep(&after, resolved))
+                .await
+                .context("runner: committing sweep")?;
+            Some(id)
+        } else {
+            warn!(after = %after, "sweep produced no code changes; skipping commit");
+            None
+        };
+
+        // Drop the items the agent ticked off so a later regular phase doesn't
+        // re-render them in the next implementer prompt. Mirrors the
+        // post-phase sweep call in `run_phase_inner`.
+        self.deferred.sweep();
+        write_atomic(&deferred_path, deferred::serialize(&self.deferred).as_bytes())
+            .context("runner: writing deferred.md after sweep step")?;
+
+        self.state.pending_sweep = false;
+        self.state.consecutive_sweeps = self.state.consecutive_sweeps.saturating_add(1);
+        // `state.completed` tracks plan progress only; sweeps do not push to
+        // it. `current_phase` already advanced when the preceding phase
+        // committed, so the runner picks the regular phase up on the next
+        // `run_phase` call.
+        state::save(&self.workspace, Some(&self.state))
+            .context("runner: persisting state.json after sweep")?;
+
+        let _ = self.events_tx.send(Event::SweepCompleted {
+            after: after.clone(),
+            resolved,
+            commit: commit.clone(),
+        });
+
+        Ok(PhaseResult::Advanced {
+            phase_id: after,
+            next_phase: Some(self.plan.current_phase.clone()),
+            commit,
+        })
     }
 
     /// Run a single agent dispatch and validate the planning artifacts on the
@@ -1011,6 +1268,18 @@ impl<A: Agent, G: Git> Runner<A, G> {
     }
 }
 
+/// Canonical serialization of just the `## Deferred phases` block of a
+/// [`DeferredDoc`]. Used by the sweep step to detect whether the agent edited
+/// any H3 entries — the sweep prompt forbids it, so any difference between the
+/// pre- and post-dispatch hash trips a halt and a deferred.md rollback.
+fn phases_block_canonical(doc: &DeferredDoc) -> String {
+    let phases_only = DeferredDoc {
+        items: Vec::new(),
+        phases: doc.phases.clone(),
+    };
+    deferred::serialize(&phases_only)
+}
+
 /// Snapshot of the agent dispatch the runner needs after the call returns.
 struct AgentDispatch {
     stop_reason: StopReason,
@@ -1328,6 +1597,63 @@ fn log_event_line(event: &Event) {
         Event::UsageUpdated(_) => {
             // Snapshot consumed by the TUI; the plain logger doesn't surface
             // running token totals to keep stderr clean.
+        }
+        Event::SweepStarted {
+            after,
+            items_pending,
+            attempt,
+        } => {
+            eprintln!(
+                "{fm} {}",
+                col(
+                    c,
+                    style::BOLD_CYAN,
+                    &format!(
+                        "sweep after phase {after} ({items_pending} pending, total dispatch {attempt})"
+                    )
+                )
+            );
+        }
+        Event::SweepCompleted {
+            after,
+            resolved,
+            commit: Some(hash),
+        } => {
+            eprintln!(
+                "{fm} {}",
+                col(
+                    c,
+                    style::GREEN,
+                    &format!("sweep after phase {after} committed: {resolved} resolved ({hash})")
+                )
+            );
+        }
+        Event::SweepCompleted {
+            after,
+            resolved,
+            commit: None,
+        } => {
+            eprintln!(
+                "{fm} {}",
+                col(
+                    c,
+                    style::DIM,
+                    &format!(
+                        "sweep after phase {after}: {resolved} resolved; no code changes to commit"
+                    )
+                )
+            );
+        }
+        Event::SweepHalted { after, reason } => {
+            eprintln!(
+                "{} {}",
+                col(c, style::BOLD_RED, "[pitboss]"),
+                col(
+                    c,
+                    style::BOLD_RED,
+                    &format!("sweep after phase {after} halted: {reason}")
+                )
+            );
         }
     }
 }

@@ -315,6 +315,33 @@ impl App {
             Event::UsageUpdated(usage) => {
                 self.token_usage = usage;
             }
+            Event::SweepStarted {
+                after,
+                items_pending,
+                attempt,
+            } => {
+                self.attempts.insert(after.clone(), attempt);
+                self.push_output(format!(
+                    "[sweep] after phase {after}: {items_pending} pending"
+                ));
+            }
+            Event::SweepCompleted {
+                after,
+                resolved,
+                commit,
+            } => {
+                let line = match commit {
+                    Some(c) => format!("[sweep] after phase {after}: {resolved} resolved ({c})"),
+                    None => format!(
+                        "[sweep] after phase {after}: {resolved} resolved; no code changes"
+                    ),
+                };
+                self.push_output(line);
+            }
+            Event::SweepHalted { after, reason } => {
+                self.activity = Activity::Halted(format_halt(&reason));
+                self.push_output(format!("[sweep:halt] after phase {after}: {reason}"));
+            }
         }
     }
 
