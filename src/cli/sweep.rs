@@ -22,7 +22,10 @@
 //!   no run has started yet.
 //!
 //! Exits 0 on a successful sweep (committed or no-changes) and 1 on a
-//! halt; state.json is persisted on the way out so a halt can be retried.
+//! halt. When a real run is in flight (`state.json` already existed),
+//! state is persisted on the halt path so the sweep can be retried.
+//! Standalone sweeps on a never-played workspace use in-memory state
+//! only; nothing is written to disk on halt.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -120,6 +123,8 @@ async fn execute_with_agent<A: Agent + 'static>(
 
     let dry_run = is_dry_run_agent(&agent);
 
+    let git = ShellGit::new(workspace.clone());
+
     let state = match existing_state {
         Some(s) => {
             if s.aborted {
@@ -130,10 +135,22 @@ async fn execute_with_agent<A: Agent + 'static>(
             }
             s
         }
-        None => runner::fresh_run_state(&plan_obj, &config, Utc::now()),
+        None => {
+            // Standalone sweep with no run in flight: synthesize an
+            // in-memory state, but pin its branch to HEAD so sweep
+            // commits and any retry-path persistence agree on where
+            // changes land. Without this the synthesized branch name
+            // would never be checked out, leaving state.branch divorced
+            // from HEAD.
+            let mut s = runner::fresh_run_state(&plan_obj, &config, Utc::now());
+            s.branch = git
+                .current_branch()
+                .await
+                .context("sweep: resolving current branch for standalone sweep state")?;
+            s
+        }
     };
 
-    let git = ShellGit::new(workspace.clone());
     if state_existed {
         // A real run is in flight — make sure HEAD is on the run branch
         // before the sweep commits, just like `pitboss rebuy` does.

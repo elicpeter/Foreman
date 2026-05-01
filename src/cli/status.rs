@@ -267,6 +267,12 @@ fn render_sweep_block(
                 dim(&format!("(tried {attempts} times)")),
             ));
         }
+        if stale.len() > STALE_DISPLAY_CAP {
+            out.push_str(&format!(
+                "    {}\n",
+                dim(&format!("… +{} more", stale.len() - STALE_DISPLAY_CAP)),
+            ));
+        }
         out.push_str(&format!(
             "    {}\n",
             dim(
