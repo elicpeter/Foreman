@@ -100,7 +100,9 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
-    fn as_str(self) -> &'static str {
+    /// Lower-case label used by `sessions.md` and exposed to plan-level hooks
+    /// via `PITBOSS_SESSION_STATUS`. Stable string — scripts read it.
+    pub fn as_str(self) -> &'static str {
         match self {
             SessionStatus::Ok => "ok",
             SessionStatus::Error => "error",

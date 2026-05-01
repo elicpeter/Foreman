@@ -349,6 +349,9 @@ pub struct GrindConfig {
     /// consecutive-failure escape valve (Phase 08 exit code 5). Defaults to
     /// `3`.
     pub consecutive_failure_limit: u32,
+    /// Wall-clock cap applied to each plan-level shell hook (Phase 10).
+    /// Defaults to `60`.
+    pub hook_timeout_secs: u64,
     /// What to do with per-session transcripts on the disk. Defaults to
     /// [`TranscriptRetention::KeepAll`].
     pub transcript_retention: TranscriptRetention,
@@ -367,6 +370,7 @@ impl Default for GrindConfig {
             default_plan: None,
             max_parallel: 1,
             consecutive_failure_limit: 3,
+            hook_timeout_secs: 60,
             transcript_retention: TranscriptRetention::default(),
             budgets: PlanBudgets::default(),
             hooks: Hooks::default(),
@@ -459,6 +463,9 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.grind.consecutive_failure_limit == 0 {
         anyhow::bail!("pitboss.toml: [grind] consecutive_failure_limit must be >= 1");
     }
+    if cfg.grind.hook_timeout_secs == 0 {
+        anyhow::bail!("pitboss.toml: [grind] hook_timeout_secs must be >= 1");
+    }
     Ok(())
 }
 
@@ -498,6 +505,7 @@ fn find_unknown_keys(value: &toml::Value) -> Vec<String> {
                 "default_plan",
                 "max_parallel",
                 "consecutive_failure_limit",
+                "hook_timeout_secs",
                 "transcript_retention",
                 "budgets",
                 "hooks",
@@ -556,6 +564,7 @@ mod tests {
         assert_eq!(cfg.grind, GrindConfig::default());
         assert_eq!(cfg.grind.max_parallel, 1);
         assert_eq!(cfg.grind.consecutive_failure_limit, 3);
+        assert_eq!(cfg.grind.hook_timeout_secs, 60);
         assert_eq!(cfg.grind.transcript_retention, TranscriptRetention::KeepAll);
         assert!(cfg.grind.prompts_dir.is_none());
         assert!(cfg.grind.default_plan.is_none());
@@ -970,6 +979,7 @@ prompts_dir = "/var/pitboss/prompts"
 default_plan = "nightly"
 max_parallel = 4
 consecutive_failure_limit = 7
+hook_timeout_secs = 90
 transcript_retention = "keep_none"
 
 [grind.budgets]
@@ -991,6 +1001,7 @@ on_failure = "echo failed"
         assert_eq!(cfg.grind.default_plan.as_deref(), Some("nightly"));
         assert_eq!(cfg.grind.max_parallel, 4);
         assert_eq!(cfg.grind.consecutive_failure_limit, 7);
+        assert_eq!(cfg.grind.hook_timeout_secs, 90);
         assert_eq!(
             cfg.grind.transcript_retention,
             TranscriptRetention::KeepNone
@@ -1018,6 +1029,7 @@ max_parallel = 2
         assert_eq!(cfg.grind.max_parallel, 2);
         // Other fields untouched.
         assert_eq!(cfg.grind.consecutive_failure_limit, 3);
+        assert_eq!(cfg.grind.hook_timeout_secs, 60);
         assert_eq!(cfg.grind.transcript_retention, TranscriptRetention::KeepAll);
         assert!(cfg.grind.budgets.max_iterations.is_none());
         assert!(cfg.grind.hooks.pre_session.is_none());
@@ -1071,5 +1083,13 @@ max_parallel = 2
         let err = parse(text).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains("consecutive_failure_limit"), "msg: {msg}");
+    }
+
+    #[test]
+    fn hook_timeout_secs_zero_is_rejected() {
+        let text = "[grind]\nhook_timeout_secs = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("hook_timeout_secs"), "msg: {msg}");
     }
 }

@@ -34,6 +34,7 @@ use crate::state::TokenUsage;
 use crate::tests as project_tests;
 
 use super::budget::{session_cost_usd, BudgetCheck, BudgetReason, BudgetTracker};
+use super::hooks::{run_hook, HookKind};
 use super::plan::{GrindPlan, PlanBudgets};
 use super::prompt::PromptDoc;
 use super::run_dir::{RunDir, SessionRecord, SessionStatus};
@@ -476,176 +477,255 @@ impl<A: Agent, G: Git> GrindRunner<A, G> {
 
         let scratchpad_path = self.run_dir.scratchpad().path_for_agent().to_path_buf();
 
-        let session_log_tail = self
-            .read_session_log_tail()
-            .unwrap_or_else(|e| format!("(failed to read sessions.md: {e})"));
-        let scratchpad_text = self
-            .run_dir
-            .scratchpad()
-            .read()
-            .unwrap_or_else(|e| format!("(failed to read scratchpad: {e})"));
-
-        let user_prompt = compose_user_prompt(
-            STANDING_INSTRUCTION_TEMPLATE,
-            &session_log_tail,
-            &scratchpad_text,
-            &prompt.body,
-        );
-
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("PITBOSS_RUN_ID".into(), self.run_id.clone());
-        env.insert("PITBOSS_PROMPT_NAME".into(), prompt.meta.name.clone());
-        env.insert(
+        let mut base_env: HashMap<String, String> = HashMap::new();
+        base_env.insert("PITBOSS_RUN_ID".into(), self.run_id.clone());
+        base_env.insert("PITBOSS_PROMPT_NAME".into(), prompt.meta.name.clone());
+        base_env.insert(
             "PITBOSS_SUMMARY_FILE".into(),
             summary_path.display().to_string(),
         );
-        env.insert(
+        base_env.insert(
             "PITBOSS_SCRATCHPAD".into(),
             scratchpad_path.display().to_string(),
         );
-        env.insert("PITBOSS_SESSION_SEQ".into(), seq.to_string());
+        base_env.insert("PITBOSS_SESSION_SEQ".into(), seq.to_string());
 
-        let timeout = prompt
-            .meta
-            .max_session_seconds
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_SESSION_TIMEOUT);
+        let hook_timeout =
+            Duration::from_secs(self.config.grind.hook_timeout_secs.max(1));
 
-        let model = self.config.models.implementer.clone();
-        let request = AgentRequest {
-            role: Role::Implementer,
-            model: model.clone(),
-            system_prompt: String::new(),
-            user_prompt,
-            workdir: self.workspace.clone(),
-            log_path: transcript_path.clone(),
-            timeout,
-            env,
-        };
-
-        // Outer wall-clock guard. The agent itself honors `request.timeout`
-        // (subprocess kill, etc.), but a misbehaving or stub agent might not
-        // — wrapping the dispatch in `tokio::time::timeout` makes the cap
-        // enforceable from pitboss's side. A timeout drops the agent future,
-        // which cancels the underlying subprocess by destruction, and we
-        // synthesize a `Timeout` outcome so the session record reflects what
-        // happened.
-        let mut summary_override: Option<String> = None;
-        let dispatch = match tokio::time::timeout(
-            timeout,
-            self.dispatch_agent(request, shutdown.cancel_token()),
-        )
-        .await
-        {
-            Ok(res) => res?,
-            Err(_) => {
+        // ---- pre_session hook ---------------------------------------------
+        // Runs before the agent dispatch. Non-zero exit / timeout / spawn
+        // failure all skip dispatch and resolve the session as `Error`.
+        let mut skip_dispatch_reason: Option<String> = None;
+        if let Some(cmd) = self.plan.hooks.pre_session.as_deref() {
+            let mut env = base_env.clone();
+            env.insert("PITBOSS_SESSION_PROMPT".into(), prompt.meta.name.clone());
+            let outcome = run_hook(
+                HookKind::PreSession,
+                cmd,
+                &env,
+                hook_timeout,
+                &transcript_path,
+            )
+            .await;
+            if !outcome.is_success() {
                 warn!(
                     run_id = %self.run_id,
                     seq,
-                    timeout_secs = timeout.as_secs(),
-                    "grind: per-prompt timeout fired"
+                    outcome = %outcome.description(),
+                    "grind: pre_session hook failed; skipping dispatch"
                 );
-                summary_override = Some(format!(
-                    "session exceeded max_session_seconds ({}s)",
-                    timeout.as_secs()
-                ));
-                AgentDispatch {
-                    stop_reason: StopReason::Timeout,
-                    tokens: TokenUsage::default(),
-                }
+                skip_dispatch_reason =
+                    Some(format!("pre_session hook {}", outcome.description()));
             }
-        };
-        let ended_at = Utc::now();
+        }
 
-        let mut status = match &dispatch.stop_reason {
-            StopReason::Completed => SessionStatus::Ok,
-            StopReason::Timeout => SessionStatus::Timeout,
-            StopReason::Cancelled => SessionStatus::Aborted,
-            StopReason::Error(_) => SessionStatus::Error,
-        };
+        let mut status: SessionStatus;
+        let summary: String;
+        let mut commit: Option<CommitId> = None;
+        let mut tokens: TokenUsage = TokenUsage::default();
+        let mut cost_usd: f64 = 0.0;
+        let ended_at: DateTime<Utc>;
 
-        let cost_usd = session_cost_usd(
-            &self.config,
-            &model,
-            dispatch.tokens.input,
-            dispatch.tokens.output,
-        );
+        if let Some(reason) = skip_dispatch_reason {
+            status = SessionStatus::Error;
+            summary = reason;
+            ended_at = Utc::now();
+        } else {
+            let session_log_tail = self
+                .read_session_log_tail()
+                .unwrap_or_else(|e| format!("(failed to read sessions.md: {e})"));
+            let scratchpad_text = self
+                .run_dir
+                .scratchpad()
+                .read()
+                .unwrap_or_else(|e| format!("(failed to read scratchpad: {e})"));
 
-        // Post-hoc cost cap. The agent can't know its rolling spend during a
-        // dispatch, so the per-prompt cost limit fires after the session
-        // completes: if the final cost is over the cap, the session is
-        // recorded as `Error` with a clear summary rather than letting the
-        // agent's own report stand.
-        if status == SessionStatus::Ok {
-            if let Some(cap) = prompt.meta.max_session_cost_usd {
-                if cost_usd > cap {
+            let user_prompt = compose_user_prompt(
+                STANDING_INSTRUCTION_TEMPLATE,
+                &session_log_tail,
+                &scratchpad_text,
+                &prompt.body,
+            );
+
+            let timeout = prompt
+                .meta
+                .max_session_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_SESSION_TIMEOUT);
+
+            let model = self.config.models.implementer.clone();
+            let request = AgentRequest {
+                role: Role::Implementer,
+                model: model.clone(),
+                system_prompt: String::new(),
+                user_prompt,
+                workdir: self.workspace.clone(),
+                log_path: transcript_path.clone(),
+                timeout,
+                env: base_env.clone(),
+            };
+
+            // Outer wall-clock guard. The agent itself honors `request.timeout`
+            // (subprocess kill, etc.), but a misbehaving or stub agent might
+            // not — wrapping the dispatch in `tokio::time::timeout` makes the
+            // cap enforceable from pitboss's side. A timeout drops the agent
+            // future, which cancels the underlying subprocess by destruction,
+            // and we synthesize a `Timeout` outcome so the session record
+            // reflects what happened.
+            let mut summary_override: Option<String> = None;
+            let dispatch = match tokio::time::timeout(
+                timeout,
+                self.dispatch_agent(request, shutdown.cancel_token()),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
                     warn!(
                         run_id = %self.run_id,
                         seq,
-                        cost = cost_usd,
-                        cap,
-                        "grind: per-prompt max_session_cost_usd exceeded"
+                        timeout_secs = timeout.as_secs(),
+                        "grind: per-prompt timeout fired"
                     );
-                    status = SessionStatus::Error;
                     summary_override = Some(format!(
-                        "session exceeded max_session_cost_usd: ${cost_usd:.4} > ${cap:.4}"
+                        "session exceeded max_session_seconds ({}s)",
+                        timeout.as_secs()
                     ));
+                    AgentDispatch {
+                        stop_reason: StopReason::Timeout,
+                        tokens: TokenUsage::default(),
+                    }
+                }
+            };
+            ended_at = Utc::now();
+
+            status = match &dispatch.stop_reason {
+                StopReason::Completed => SessionStatus::Ok,
+                StopReason::Timeout => SessionStatus::Timeout,
+                StopReason::Cancelled => SessionStatus::Aborted,
+                StopReason::Error(_) => SessionStatus::Error,
+            };
+
+            cost_usd = session_cost_usd(
+                &self.config,
+                &model,
+                dispatch.tokens.input,
+                dispatch.tokens.output,
+            );
+
+            // Post-hoc cost cap. The agent can't know its rolling spend during
+            // a dispatch, so the per-prompt cost limit fires after the session
+            // completes: if the final cost is over the cap, the session is
+            // recorded as `Error` with a clear summary rather than letting the
+            // agent's own report stand.
+            if status == SessionStatus::Ok {
+                if let Some(cap) = prompt.meta.max_session_cost_usd {
+                    if cost_usd > cap {
+                        warn!(
+                            run_id = %self.run_id,
+                            seq,
+                            cost = cost_usd,
+                            cap,
+                            "grind: per-prompt max_session_cost_usd exceeded"
+                        );
+                        status = SessionStatus::Error;
+                        summary_override = Some(format!(
+                            "session exceeded max_session_cost_usd: ${cost_usd:.4} > ${cap:.4}"
+                        ));
+                    }
                 }
             }
-        }
 
-        let summary = match summary_override {
-            Some(s) => s,
-            None => read_summary_or_fallback(&summary_path),
-        };
+            summary = match summary_override {
+                Some(s) => s,
+                None => read_summary_or_fallback(&summary_path),
+            };
 
-        if status == SessionStatus::Ok && prompt.meta.verify {
-            status = self.verify_session(seq, prompt, &transcript_path).await?;
-        }
-
-        let commit = match status {
-            SessionStatus::Ok | SessionStatus::Error => {
-                // We try to land whatever changes the agent produced even on
-                // Error so partial work isn't lost; the session record carries
-                // the status verbatim. Aborted/Timeout sessions skip the
-                // commit step because the working tree state is undefined.
-                // Dirty is set later (after the stash) so it never reaches
-                // this match.
-                self.try_commit_session(seq, prompt).await?
+            if status == SessionStatus::Ok && prompt.meta.verify {
+                status = self.verify_session(seq, prompt, &transcript_path).await?;
             }
-            _ => None,
-        };
 
-        // Stash any stragglers so the next session starts clean. Sessions that
-        // already aborted leave behind whatever the agent produced — stashing
-        // it labeled is preferable to discarding. `.pitboss/` is excluded so
-        // the run's own bookkeeping (sessions.jsonl, scratchpad, transcripts)
-        // stays in place between sessions.
-        let stash_label = format!("grind/{}/session-{:04}-leftover", self.run_id, seq);
-        let pitboss_rel = Path::new(".pitboss");
-        match self.git.stash_push(&stash_label, &[pitboss_rel]).await {
-            Ok(true) => {
-                warn!(
-                    run_id = %self.run_id,
-                    seq,
-                    stash = %stash_label,
-                    "grind: leftover changes stashed"
-                );
-                // The session itself was otherwise clean — the dirty marker
-                // is a triage hint, not an outright failure. Aborted /
-                // Timeout / Error stay as-is so the failure mode is preserved.
-                if status == SessionStatus::Ok {
-                    status = SessionStatus::Dirty;
+            commit = match status {
+                SessionStatus::Ok | SessionStatus::Error => {
+                    // We try to land whatever changes the agent produced even
+                    // on Error so partial work isn't lost; the session record
+                    // carries the status verbatim. Aborted/Timeout sessions
+                    // skip the commit step because the working tree state is
+                    // undefined. Dirty is set later (after the stash) so it
+                    // never reaches this match.
+                    self.try_commit_session(seq, prompt).await?
+                }
+                _ => None,
+            };
+
+            // Stash any stragglers so the next session starts clean. Sessions
+            // that already aborted leave behind whatever the agent produced —
+            // stashing it labeled is preferable to discarding. `.pitboss/` is
+            // excluded so the run's own bookkeeping (sessions.jsonl,
+            // scratchpad, transcripts) stays in place between sessions.
+            let stash_label = format!("grind/{}/session-{:04}-leftover", self.run_id, seq);
+            let pitboss_rel = Path::new(".pitboss");
+            match self.git.stash_push(&stash_label, &[pitboss_rel]).await {
+                Ok(true) => {
+                    warn!(
+                        run_id = %self.run_id,
+                        seq,
+                        stash = %stash_label,
+                        "grind: leftover changes stashed"
+                    );
+                    // The session itself was otherwise clean — the dirty
+                    // marker is a triage hint, not an outright failure.
+                    // Aborted / Timeout / Error stay as-is so the failure mode
+                    // is preserved.
+                    if status == SessionStatus::Ok {
+                        status = SessionStatus::Dirty;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        run_id = %self.run_id,
+                        seq,
+                        error = %format!("{e:#}"),
+                        "grind: stash_push failed"
+                    );
                 }
             }
-            Ok(false) => {}
-            Err(e) => {
-                warn!(
-                    run_id = %self.run_id,
-                    seq,
-                    error = %format!("{e:#}"),
-                    "grind: stash_push failed"
-                );
+
+            tokens = dispatch.tokens;
+        }
+
+        // ---- post_session / on_failure hooks ------------------------------
+        // post_session fires for every resolved session regardless of status;
+        // on_failure fires only when the status is non-`Ok`. Both receive
+        // `PITBOSS_SESSION_STATUS` and `PITBOSS_SESSION_SUMMARY` on top of the
+        // shared agent env, plus `PITBOSS_SESSION_PROMPT`. Their exit codes
+        // are logged but do not influence the recorded session status.
+        let mut hook_env = base_env.clone();
+        hook_env.insert("PITBOSS_SESSION_PROMPT".into(), prompt.meta.name.clone());
+        hook_env.insert("PITBOSS_SESSION_STATUS".into(), status.as_str().to_string());
+        hook_env.insert("PITBOSS_SESSION_SUMMARY".into(), summary.clone());
+        if let Some(cmd) = self.plan.hooks.post_session.as_deref() {
+            let _ = run_hook(
+                HookKind::PostSession,
+                cmd,
+                &hook_env,
+                hook_timeout,
+                &transcript_path,
+            )
+            .await;
+        }
+        if status != SessionStatus::Ok {
+            if let Some(cmd) = self.plan.hooks.on_failure.as_deref() {
+                let _ = run_hook(
+                    HookKind::OnFailure,
+                    cmd,
+                    &hook_env,
+                    hook_timeout,
+                    &transcript_path,
+                )
+                .await;
             }
         }
 
@@ -658,7 +738,7 @@ impl<A: Agent, G: Git> GrindRunner<A, G> {
             status,
             summary: Some(summary),
             commit,
-            tokens: dispatch.tokens,
+            tokens,
             cost_usd,
             transcript_path: transcript_rel,
         })

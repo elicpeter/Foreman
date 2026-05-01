@@ -12,6 +12,7 @@
 
 pub mod budget;
 pub mod discovery;
+pub mod hooks;
 pub mod plan;
 pub mod prompt;
 pub mod run;
@@ -27,6 +28,7 @@ pub use budget::{
 pub use discovery::{
     discover_prompts, resolve_home_prompts_dir, DiscoveryOptions, DiscoveryResult,
 };
+pub use hooks::{run_hook, HookKind, HookOutcome};
 pub use plan::{
     default_plan_from_dir, load_plan, parse_plan_str, GrindPlan, Hooks, PlanBudgets, PlanLoadError,
     PlanPromptRef, PlanValidationError, DEFAULT_PLAN_NAME,
