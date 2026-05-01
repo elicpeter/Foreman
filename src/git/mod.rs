@@ -200,6 +200,22 @@ pub fn commit_message(phase_id: &PhaseId, title: &str) -> String {
     format!("[pitboss] phase {}: {}", phase_id, title)
 }
 
+/// Build the per-sweep commit subject. Format:
+/// `[pitboss] sweep after phase <id>: <n> deferred items resolved`, with the
+/// `n=0` case rendered as `[pitboss] sweep after phase <id>: no items resolved`.
+/// Distinct from [`commit_message`] so log-greppers can tell sweep commits
+/// apart from regular phase commits at a glance.
+pub fn commit_message_sweep(after: &PhaseId, resolved: usize) -> String {
+    if resolved == 0 {
+        format!("[pitboss] sweep after phase {}: no items resolved", after)
+    } else {
+        format!(
+            "[pitboss] sweep after phase {}: {} deferred items resolved",
+            after, resolved
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +245,18 @@ mod tests {
         assert_eq!(
             commit_message(&pid("10b"), "Followup"),
             "[pitboss] phase 10b: Followup"
+        );
+    }
+
+    #[test]
+    fn commit_message_sweep_uses_canonical_format() {
+        assert_eq!(
+            commit_message_sweep(&pid("02"), 4),
+            "[pitboss] sweep after phase 02: 4 deferred items resolved"
+        );
+        assert_eq!(
+            commit_message_sweep(&pid("10b"), 0),
+            "[pitboss] sweep after phase 10b: no items resolved"
         );
     }
 

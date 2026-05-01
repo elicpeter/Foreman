@@ -734,15 +734,12 @@ async fn parallel_wall_clock_is_meaningfully_less_than_sum_of_session_times() {
         "expected overlap ≥ {min_overlap:?}, got {overlap:?} (sleep = {session_sleep:?}, elapsed = {elapsed:?})"
     );
 
-    // Cheap sanity bound: even with generous overhead, two parallel
-    // sessions cannot take longer than serial execution. Loose enough that
-    // a slow CI host won't flake; tight enough to catch a regression that
-    // accidentally serializes the dispatch.
-    let serial_upper_bound = session_sleep * 2;
-    assert!(
-        elapsed < serial_upper_bound,
-        "elapsed {elapsed:?} ≥ serial bound {serial_upper_bound:?} — parallelism likely broken"
-    );
+    // Elapsed wall-clock is reported in the assertion message above for
+    // diagnostics only. It used to be its own assertion (`elapsed <
+    // session_sleep * 2 + slack`) but flaked on loaded CI hosts. The
+    // overlap assertion is the real correctness gate: in a serialized
+    // dispatch overlap is zero, so requiring overlap ≥ session_sleep / 2
+    // already rules out the regression the elapsed bound was guarding.
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -54,9 +54,27 @@ pub enum StartMode {
 /// step described in [`execute`]; either it or `git.create_pr = true` in
 /// `.pitboss/config.toml` enables the step. `dry_run` swaps the configured
 /// agent for the deterministic [`DryRunAgent`] so the run can be exercised
-/// end-to-end without any model spend.
-pub async fn run(workspace: PathBuf, tui: bool, pr: bool, dry_run: bool) -> Result<()> {
-    execute(workspace, tui, pr, dry_run, StartMode::Fresh).await
+/// end-to-end without any model spend. `no_sweep` and `force_sweep` map to
+/// the matching runner overrides — the clap layer enforces mutual
+/// exclusion so at most one is `true`.
+pub async fn run(
+    workspace: PathBuf,
+    tui: bool,
+    pr: bool,
+    dry_run: bool,
+    no_sweep: bool,
+    force_sweep: bool,
+) -> Result<()> {
+    execute(
+        workspace,
+        tui,
+        pr,
+        dry_run,
+        no_sweep,
+        force_sweep,
+        StartMode::Fresh,
+    )
+    .await
 }
 
 /// Shared runner driver used by both `pitboss play` and `pitboss rebuy`.
@@ -87,23 +105,48 @@ pub async fn execute(
     tui: bool,
     pr_flag: bool,
     dry_run: bool,
+    no_sweep: bool,
+    force_sweep: bool,
     mode: StartMode,
 ) -> Result<()> {
     let config = config::load(&workspace)
         .with_context(|| format!("run: loading config in {:?}", workspace))?;
     if dry_run {
-        execute_with_agent(workspace, config, tui, false, mode, dry_run_agent()).await
+        execute_with_agent(
+            workspace,
+            config,
+            tui,
+            false,
+            no_sweep,
+            force_sweep,
+            mode,
+            dry_run_agent(),
+        )
+        .await
     } else {
         let agent = agent::build_agent(&config)?;
-        execute_with_agent(workspace, config, tui, pr_flag, mode, agent).await
+        execute_with_agent(
+            workspace,
+            config,
+            tui,
+            pr_flag,
+            no_sweep,
+            force_sweep,
+            mode,
+            agent,
+        )
+        .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_with_agent<A: Agent + 'static>(
     workspace: PathBuf,
     config: config::Config,
     tui: bool,
     pr_flag: bool,
+    no_sweep: bool,
+    force_sweep: bool,
     mode: StartMode,
     agent: A,
 ) -> Result<()> {
@@ -156,8 +199,10 @@ async fn execute_with_agent<A: Agent + 'static>(
 
     let want_pr = pr_flag || config.git.create_pr;
 
-    let mut runner =
-        Runner::new(workspace, config, plan, deferred, state, agent, git).skip_tests(dry_run);
+    let mut runner = Runner::new(workspace, config, plan, deferred, state, agent, git)
+        .skip_tests(dry_run)
+        .skip_sweep(no_sweep)
+        .force_sweep(force_sweep);
 
     let summary = if tui {
         tui::run(&mut runner).await?

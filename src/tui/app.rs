@@ -5,6 +5,30 @@
 //! of agent output lines. Rendering is a pure function of that snapshot, so
 //! the same code path is exercised by the live dashboard and the snapshot
 //! tests at the bottom of this file.
+//!
+//! # Manual sweep / stale-items checklist
+//!
+//! The five phase 07 sweep frames are verified by hand against a real run.
+//! To drive each frame:
+//!
+//! 1. **Sweep in flight.** Configure `[sweep] trigger_threshold = 1`, leave
+//!    one unchecked `## Deferred items` entry in `deferred.md`, and run
+//!    `pitboss play --tui`. After the first phase commits, the gate fires
+//!    a sweep and the header should read `Sweep after phase NN — attempt 1`
+//!    with `[implementer]` in the activity bracket.
+//! 2. **Sweep auditor.** With `[sweep] audit_enabled = true`, watch the
+//!    sweep dispatch land staged changes — the header should switch to
+//!    `Sweep after phase NN — auditor` with `[auditor]` bracketed.
+//! 3. **Sweep completed.** When `SweepCompleted` lands, a `[sweep] after NN:
+//!    K resolved (commit)` row should appear in the agent output pane in
+//!    the same cyan style as the `[commit]` rows.
+//! 4. **Sweep halted.** Force a sweep auditor halt (e.g., a deferred item
+//!    whose verification step the auditor will reject). The header switches
+//!    to `[halted: ...]` and a red `[sweep:halt]` row joins the output pane.
+//! 5. **Stale items panel.** Set `[sweep] escalate_after = 1`, leave the
+//!    same unchecked item in place across two sweep dispatches. After the
+//!    second sweep, the new collapsible "stale items" panel under
+//!    "session" should list the item in yellow.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -15,10 +39,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use tracing::debug;
 
 use crate::config::ModelPricing;
 use crate::plan::{PhaseId, Plan};
-use crate::runner::{Event, HaltReason};
+use crate::prompts::StaleItem;
+use crate::runner::{AuditContextKind, Event, HaltReason};
 use crate::state::{RunState, TokenUsage};
 
 /// Cap on the agent output buffer. Old lines are dropped once the cap is
@@ -29,6 +55,17 @@ pub const OUTPUT_BUFFER_LINES: usize = 1000;
 /// fixed eight content lines (elapsed / cost / tokens / dispatches plus a
 /// `by role` heading and three role rows) inside its border.
 const STATS_HEIGHT: u16 = 10;
+
+/// Height of the stale-items panel under the session-stats panel. Sized to
+/// fit five content lines plus the title border. The panel auto-collapses
+/// when the stale list is empty so this only contributes when there is
+/// something to show.
+const STALE_HEIGHT: u16 = 7;
+
+// Cap on the number of stale items rendered in the panel. Shared with
+// `pitboss status` via [`crate::runner::STALE_ITEMS_DISPLAY_CAP`] so the two
+// operator surfaces stay in lockstep; both add a "+N more" footer past this.
+use crate::runner::STALE_ITEMS_DISPLAY_CAP as STALE_PANEL_CAP;
 
 /// Slice of [`crate::config::Config`] needed to price running token usage in
 /// the session-stats panel. Built by [`crate::tui::run`] from the runner's
@@ -82,12 +119,16 @@ pub enum PhaseStatus {
 pub enum Activity {
     /// Run has not started dispatching agents yet.
     Idle,
-    /// Implementer dispatch is in flight.
+    /// Implementer dispatch for a regular phase is in flight.
     Implementer,
+    /// Implementer dispatch for a deferred-sweep step is in flight.
+    SweepImplementer,
     /// Fixer dispatch is in flight; carries the 1-based attempt index.
     Fixer(u32),
-    /// Auditor dispatch is in flight.
+    /// Auditor dispatch for a regular phase is in flight.
     Auditor,
+    /// Auditor dispatch for a deferred-sweep step is in flight.
+    SweepAuditor,
     /// Auditor was skipped because the staged diff was empty.
     AuditorSkipped,
     /// Test runner is active.
@@ -103,14 +144,36 @@ impl fmt::Display for Activity {
         match self {
             Activity::Idle => f.write_str("idle"),
             Activity::Implementer => f.write_str("implementer"),
+            Activity::SweepImplementer => f.write_str("sweep:implementer"),
             Activity::Fixer(n) => write!(f, "fixer (attempt {n})"),
             Activity::Auditor => f.write_str("auditor"),
+            Activity::SweepAuditor => f.write_str("sweep:auditor"),
             Activity::AuditorSkipped => f.write_str("auditor (skipped, no diff)"),
             Activity::Tests => f.write_str("running tests"),
             Activity::Done => f.write_str("finished"),
             Activity::Halted(s) => write!(f, "halted: {s}"),
         }
     }
+}
+
+/// Active sweep tracked by the dashboard.
+///
+/// Set on [`Event::SweepStarted`], updated when the sweep auditor fires, and
+/// cleared on [`Event::SweepCompleted`] or [`Event::SweepHalted`]. While set,
+/// the header takes its label from this struct rather than from the current
+/// phase title so the operator can tell at a glance that a sweep — not a
+/// regular phase dispatch — is in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepState {
+    /// Phase id the sweep is firing after (mirrors
+    /// [`Event::SweepStarted::after`]).
+    after: PhaseId,
+    /// 1-based total dispatch counter at `after` for this sweep, mirrored
+    /// from the event payload.
+    attempt: u32,
+    /// `true` once the sweep auditor has been observed for this sweep —
+    /// the header switches from `attempt N` to `auditor` while it runs.
+    in_auditor: bool,
 }
 
 /// Terminal-side dashboard state. Built once from a snapshot of the
@@ -128,6 +191,15 @@ pub struct App {
     completed: Vec<PhaseId>,
     attempts: HashMap<PhaseId, u32>,
     activity: Activity,
+    /// Tracks an in-flight sweep so the header and panels can render its
+    /// label distinctly. `None` outside of a sweep dispatch.
+    sweep_state: Option<SweepState>,
+    /// Stale `## Deferred items` entries (counters at or above
+    /// `[sweep] escalate_after`). Sorted by descending attempts. Hydrated
+    /// from [`RunState::deferred_item_attempts`] at startup and updated on
+    /// [`Event::DeferredItemStale`] at runtime. Capped at the prompt-side
+    /// max so a runaway map can't bloat the panel.
+    stale_items: Vec<StaleItem>,
     /// Active backend / per-role model strings rendered in the header. Static
     /// for the run; the rendered value tracks `activity` to show the model
     /// the currently dispatched role is using.
@@ -159,12 +231,16 @@ impl App {
     /// drive. `plan` is held as-is (it serves as the static phase list);
     /// `state` seeds the run-level header fields; `agent_display` populates
     /// the static agent / per-role model chip in the header; `usage_view`
-    /// supplies the pricing table the session-stats panel uses.
+    /// supplies the pricing table the session-stats panel uses;
+    /// `stale_items` rehydrates the stale-items panel from the runner's
+    /// staleness tracker (`Runner::stale_items`) so a resumed run shows the
+    /// same list `pitboss status` would.
     pub fn new(
         plan: Plan,
         state: RunState,
         agent_display: AgentDisplay,
         usage_view: UsageView,
+        stale_items: Vec<StaleItem>,
     ) -> Self {
         let mut phase_status = HashMap::new();
         for phase in &plan.phases {
@@ -181,6 +257,8 @@ impl App {
             completed: state.completed.clone(),
             attempts: state.attempts.clone(),
             activity: Activity::Idle,
+            sweep_state: None,
+            stale_items,
             agent_display,
             usage_view,
             token_usage: state.token_usage.clone(),
@@ -246,6 +324,7 @@ impl App {
                 self.attempts.insert(phase_id.clone(), attempt);
                 self.current_phase = phase_id;
                 self.activity = Activity::Implementer;
+                self.sweep_state = None;
             }
             Event::FixerStarted {
                 phase_id,
@@ -255,12 +334,25 @@ impl App {
                 self.attempts.insert(phase_id, attempt);
                 self.activity = Activity::Fixer(fixer_attempt);
             }
-            Event::AuditorStarted { phase_id, attempt } => {
-                self.attempts.insert(phase_id, attempt);
-                self.activity = Activity::Auditor;
+            Event::AuditorStarted { context, attempt } => {
+                self.attempts.insert(context.phase_id.clone(), attempt);
+                self.activity = match context.kind {
+                    AuditContextKind::Phase => Activity::Auditor,
+                    AuditContextKind::Sweep => Activity::SweepAuditor,
+                };
+                if context.kind == AuditContextKind::Sweep {
+                    if let Some(sweep) = self.sweep_state.as_mut() {
+                        sweep.in_auditor = true;
+                    }
+                }
             }
-            Event::AuditorSkippedNoChanges { .. } => {
+            Event::AuditorSkippedNoChanges { context } => {
                 self.activity = Activity::AuditorSkipped;
+                if context.kind == AuditContextKind::Sweep {
+                    if let Some(sweep) = self.sweep_state.as_mut() {
+                        sweep.in_auditor = true;
+                    }
+                }
             }
             Event::AgentStdout(line) => {
                 if !self.paused {
@@ -315,6 +407,68 @@ impl App {
             Event::UsageUpdated(usage) => {
                 self.token_usage = usage;
             }
+            Event::SweepStarted {
+                after,
+                items_pending,
+                attempt,
+            } => {
+                if !self.completed.contains(&after) {
+                    debug!(
+                        "tui: SweepStarted for phase {after} arrived without a preceding \
+                         PhaseCommitted; rendering with the state we have"
+                    );
+                    self.push_output(format!(
+                        "[tui:warn] SweepStarted({after}) without PhaseCommitted({after}); \
+                         event stream out of order"
+                    ));
+                }
+                self.attempts.insert(after.clone(), attempt);
+                self.activity = Activity::SweepImplementer;
+                self.sweep_state = Some(SweepState {
+                    after: after.clone(),
+                    attempt,
+                    in_auditor: false,
+                });
+                self.push_output(format!(
+                    "[sweep] after phase {after}: {items_pending} pending"
+                ));
+            }
+            Event::SweepCompleted {
+                after,
+                resolved,
+                commit,
+            } => {
+                if self.sweep_state.is_none() {
+                    debug!(
+                        "tui: SweepCompleted for phase {after} arrived without a preceding \
+                         SweepStarted; rendering with the state we have"
+                    );
+                    self.push_output(format!(
+                        "[tui:warn] SweepCompleted({after}) without SweepStarted({after}); \
+                         event stream out of order"
+                    ));
+                }
+                self.sweep_state = None;
+                // The sweep has finished; clear the sweep-specific
+                // activity so the chip doesn't misleadingly read
+                // `[sweep:implementer]` while we wait for the next
+                // PhaseStarted / TestStarted / RunFinished. Idle is the
+                // accurate "between dispatches" state.
+                self.activity = Activity::Idle;
+                let line = match commit {
+                    Some(c) => format!("[sweep] after {after}: {resolved} items resolved ({c})"),
+                    None => format!("[sweep] after {after}: {resolved} items resolved"),
+                };
+                self.push_output(line);
+            }
+            Event::SweepHalted { after, reason } => {
+                self.sweep_state = None;
+                self.activity = Activity::Halted(format_halt(&reason));
+                self.push_output(format!("[sweep:halt] after phase {after}: {reason}"));
+            }
+            Event::DeferredItemStale { text, attempts } => {
+                self.upsert_stale_item(text, attempts);
+            }
         }
     }
 
@@ -323,6 +477,22 @@ impl App {
             self.output.pop_front();
         }
         self.output.push_back(line);
+    }
+
+    /// Insert a stale item or update its attempt count. Keeps the list sorted
+    /// by descending attempts (text ascending as a deterministic tiebreaker)
+    /// and capped at the prompt-side max so the panel can't grow unbounded
+    /// when many items go stale in the same run.
+    fn upsert_stale_item(&mut self, text: String, attempts: u32) {
+        if let Some(existing) = self.stale_items.iter_mut().find(|s| s.text == text) {
+            existing.attempts = attempts;
+        } else {
+            self.stale_items.push(StaleItem { text, attempts });
+        }
+        self.stale_items
+            .sort_by(|a, b| b.attempts.cmp(&a.attempts).then(a.text.cmp(&b.text)));
+        self.stale_items
+            .truncate(crate::runner::STALE_ITEMS_PROMPT_CAP);
     }
 
     /// Render the entire dashboard. Pure function of `&self` so the same
@@ -343,11 +513,6 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let title = self
-            .plan
-            .phase(&self.current_phase)
-            .map(|p| p.title.as_str())
-            .unwrap_or("");
         let line1 = Line::from(vec![
             Span::styled(
                 "pitboss",
@@ -367,24 +532,55 @@ impl App {
             ),
         ]);
         let act_color = activity_color(&self.activity);
-        let line2 = Line::from(vec![
-            Span::styled("phase ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                self.current_phase.to_string(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" — ", Style::default().fg(Color::Gray)),
-            Span::styled(title.to_string(), Style::default().fg(Color::White)),
-            Span::raw("   "),
-            Span::styled("[", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", self.activity),
-                Style::default().fg(act_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("]", Style::default().fg(Color::DarkGray)),
-        ]);
+        let line2 = if let Some(sweep) = &self.sweep_state {
+            let label = if sweep.in_auditor {
+                format!("Sweep after phase {} — auditor", sweep.after)
+            } else {
+                format!(
+                    "Sweep after phase {} — attempt {}",
+                    sweep.after, sweep.attempt
+                )
+            };
+            Line::from(vec![
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", self.activity),
+                    Style::default().fg(act_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("]", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            let title = self
+                .plan
+                .phase(&self.current_phase)
+                .map(|p| p.title.as_str())
+                .unwrap_or("");
+            Line::from(vec![
+                Span::styled("phase ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    self.current_phase.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" — ", Style::default().fg(Color::Gray)),
+                Span::styled(title.to_string(), Style::default().fg(Color::White)),
+                Span::raw("   "),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", self.activity),
+                    Style::default().fg(act_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("]", Style::default().fg(Color::DarkGray)),
+            ])
+        };
         let line3 = Line::from(vec![
             Span::styled("agent ", Style::default().fg(Color::Gray)),
             Span::styled(
@@ -411,7 +607,9 @@ impl App {
     fn current_model(&self) -> &str {
         match &self.activity {
             Activity::Fixer(_) => &self.agent_display.fixer_model,
-            Activity::Auditor | Activity::AuditorSkipped => &self.agent_display.auditor_model,
+            Activity::Auditor | Activity::SweepAuditor | Activity::AuditorSkipped => {
+                &self.agent_display.auditor_model
+            }
             _ => &self.agent_display.implementer_model,
         }
     }
@@ -421,10 +619,25 @@ impl App {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(area);
-        // Drop the stats panel on terminals too short to fit it without
-        // squeezing the phase list to nothing — the panel needs `STATS_HEIGHT`
-        // rows plus a couple for the phase list to remain useful.
-        if cols[0].height >= STATS_HEIGHT + 4 {
+        // Layout heuristic: stale items get squeezed first, then the session
+        // stats. The phase list always renders so the operator can see where
+        // they are in the run even on a tiny terminal.
+        let height = cols[0].height;
+        let want_stale = !self.stale_items.is_empty() && height >= STATS_HEIGHT + STALE_HEIGHT + 4;
+        let want_stats = height >= STATS_HEIGHT + 4;
+        if want_stale {
+            let left = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(0),
+                    Constraint::Length(STATS_HEIGHT),
+                    Constraint::Length(STALE_HEIGHT),
+                ])
+                .split(cols[0]);
+            self.render_phases(frame, left[0]);
+            self.render_stats(frame, left[1]);
+            self.render_stale(frame, left[2]);
+        } else if want_stats {
             let left = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(STATS_HEIGHT)])
@@ -575,6 +788,46 @@ impl App {
         frame.render_widget(para, area);
     }
 
+    fn render_stale(&self, frame: &mut Frame, area: Rect) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let stale_style = Style::default().fg(Color::Yellow);
+        let count_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+
+        let total = self.stale_items.len();
+        let take = total.min(STALE_PANEL_CAP);
+        let mut lines: Vec<Line> = Vec::with_capacity(take + 1);
+        for item in self.stale_items.iter().take(take) {
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let prefix = format!(" {}x ", item.attempts);
+            let avail = inner_width.saturating_sub(prefix.len());
+            let truncated = truncate_for_panel(&item.text, avail);
+            lines.push(Line::from(vec![
+                Span::styled(prefix, count_style),
+                Span::styled(truncated, stale_style),
+            ]));
+        }
+        if total > take {
+            let extra = total - take;
+            lines.push(Line::from(Span::styled(format!(" +{extra} more"), dim)));
+        }
+
+        let mut title = format!(" stale items ({total}) ");
+        if total == 0 {
+            // Defensive: render_stale shouldn't be called with no items, but
+            // if it is, keep the title accurate rather than rendering an
+            // empty panel with a stale `(N)` count.
+            title = " stale items ".to_string();
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(stale_style)
+            .title(Span::styled(title, count_style));
+        let para = Paragraph::new(lines).block(block);
+        frame.render_widget(para, area);
+    }
+
     fn role_usd(&self, role: &str, input: u64, output: u64) -> f64 {
         let Some((_, model)) = self.usage_view.role_models.iter().find(|(r, _)| r == role) else {
             return 0.0;
@@ -665,6 +918,25 @@ impl App {
     }
 }
 
+fn truncate_for_panel(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let collapsed: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else if max <= 1 {
+        collapsed.chars().take(max).collect()
+    } else {
+        let head: String = collapsed.chars().take(max - 1).collect();
+        format!("{head}…")
+    }
+}
+
 fn style_output_line(s: &str) -> Line<'static> {
     if s.starts_with("err: ") {
         Line::from(Span::styled(s.to_owned(), Style::default().fg(Color::Red)))
@@ -688,6 +960,13 @@ fn style_output_line(s: &str) -> Line<'static> {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ))
     } else if s.starts_with("[commit]") {
+        Line::from(Span::styled(s.to_owned(), Style::default().fg(Color::Cyan)))
+    } else if s.starts_with("[sweep:halt]") {
+        Line::from(Span::styled(
+            s.to_owned(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    } else if s.starts_with("[sweep]") {
         Line::from(Span::styled(s.to_owned(), Style::default().fg(Color::Cyan)))
     } else if s.starts_with("[halt]") {
         Line::from(Span::styled(
@@ -730,9 +1009,9 @@ fn status_style(s: &PhaseStatus) -> Style {
 fn activity_color(a: &Activity) -> Color {
     match a {
         Activity::Idle => Color::DarkGray,
-        Activity::Implementer => Color::Cyan,
+        Activity::Implementer | Activity::SweepImplementer => Color::Cyan,
         Activity::Fixer(_) => Color::Yellow,
-        Activity::Auditor | Activity::AuditorSkipped => Color::Blue,
+        Activity::Auditor | Activity::SweepAuditor | Activity::AuditorSkipped => Color::Blue,
         Activity::Tests => Color::Magenta,
         Activity::Done => Color::Green,
         Activity::Halted(_) => Color::Red,
@@ -810,6 +1089,7 @@ mod tests {
     use super::*;
 
     use crate::plan::{Phase, PhaseId};
+    use crate::runner::{AuditContext, EventDiscriminants};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -926,6 +1206,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         app.handle_event(Event::PhaseStarted {
             phase_id: pid("01"),
@@ -944,6 +1225,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         app.handle_event(Event::FixerStarted {
             phase_id: pid("01"),
@@ -961,6 +1243,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         app.handle_event(Event::PhaseStarted {
             phase_id: pid("01"),
@@ -982,6 +1265,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         app.handle_event(Event::PhaseHalted {
             phase_id: pid("02"),
@@ -1001,6 +1285,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         app.handle_event(Event::AgentStdout("first line".into()));
         app.handle_event(Event::AgentStdout("second".into()));
@@ -1028,6 +1313,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         // Idle / pre-dispatch falls back to the implementer's model.
         assert_eq!(app.current_model(), "claude-opus-4-7");
@@ -1047,7 +1333,10 @@ mod tests {
         assert_eq!(app.current_model(), "claude-sonnet-4-6");
 
         app.handle_event(Event::AuditorStarted {
-            phase_id: pid("01"),
+            context: AuditContext {
+                phase_id: pid("01"),
+                kind: AuditContextKind::Phase,
+            },
             attempt: 3,
         });
         assert_eq!(app.current_model(), "claude-sonnet-4-6");
@@ -1068,6 +1357,7 @@ mod tests {
             fresh_state_at(started_at),
             fixture_agent(),
             fixture_usage_view(),
+            Vec::new(),
         );
         app.set_now(started_at);
         // Push enough single-line entries to fill the pane, plus a long line
@@ -1095,6 +1385,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             UsageView::default(),
+            Vec::new(),
         );
         for i in 0..(OUTPUT_BUFFER_LINES + 5) {
             app.handle_event(Event::AgentStdout(format!("line {i}")));
@@ -1113,6 +1404,7 @@ mod tests {
             fresh_state_at(started_at),
             fixture_agent(),
             fixture_usage_view(),
+            Vec::new(),
         );
         app.set_now(started_at);
         let snap = render_to_string(&app, 80, 20);
@@ -1127,6 +1419,7 @@ mod tests {
             fresh_state_at(started_at),
             fixture_agent(),
             fixture_usage_view(),
+            Vec::new(),
         );
         // 2 minutes 14 seconds into the run.
         app.set_now(started_at + chrono::Duration::seconds(134));
@@ -1192,6 +1485,7 @@ mod tests {
             fresh_state_at(started_at),
             fixture_agent(),
             fixture_usage_view(),
+            Vec::new(),
         );
         app.set_now(started_at + chrono::Duration::seconds(45));
         app.handle_event(Event::PhaseStarted {
@@ -1214,6 +1508,7 @@ mod tests {
             fresh_state(),
             fixture_agent(),
             fixture_usage_view(),
+            Vec::new(),
         );
         assert_eq!(app.token_usage.input, 0);
         let mut usage = TokenUsage {
@@ -1252,5 +1547,519 @@ mod tests {
         assert_eq!(format_elapsed(chrono::Duration::seconds(45)), "45s");
         assert_eq!(format_elapsed(chrono::Duration::seconds(125)), "2m 05s");
         assert_eq!(format_elapsed(chrono::Duration::seconds(3_725)), "1h 02m");
+    }
+
+    /// Build a fully-populated event of every variant. A new variant added to
+    /// `Event` without a matching arm here causes a compile error, which in
+    /// turn forces a TUI handler review at the same time. This is the
+    /// "exhaustiveness test" called for in phase 07.
+    fn one_of_each_event() -> Vec<Event> {
+        vec![
+            Event::PhaseStarted {
+                phase_id: pid("01"),
+                title: "Project foundation".into(),
+                attempt: 1,
+            },
+            Event::FixerStarted {
+                phase_id: pid("01"),
+                fixer_attempt: 1,
+                attempt: 2,
+            },
+            Event::AuditorStarted {
+                context: AuditContext {
+                    phase_id: pid("01"),
+                    kind: AuditContextKind::Phase,
+                },
+                attempt: 3,
+            },
+            Event::AuditorSkippedNoChanges {
+                context: AuditContext {
+                    phase_id: pid("01"),
+                    kind: AuditContextKind::Phase,
+                },
+            },
+            Event::AgentStdout("line".into()),
+            Event::AgentStderr("err".into()),
+            Event::AgentToolUse("Read".into()),
+            Event::TestStarted,
+            Event::TestFinished {
+                passed: true,
+                summary: "1 passed".into(),
+            },
+            Event::TestsSkipped,
+            Event::PhaseCommitted {
+                phase_id: pid("01"),
+                commit: Some(crate::git::CommitId::new("deadbeef")),
+            },
+            Event::SweepStarted {
+                after: pid("01"),
+                items_pending: 3,
+                attempt: 1,
+            },
+            Event::AuditorStarted {
+                context: AuditContext {
+                    phase_id: pid("01"),
+                    kind: AuditContextKind::Sweep,
+                },
+                attempt: 2,
+            },
+            Event::AuditorSkippedNoChanges {
+                context: AuditContext {
+                    phase_id: pid("01"),
+                    kind: AuditContextKind::Sweep,
+                },
+            },
+            Event::SweepCompleted {
+                after: pid("01"),
+                resolved: 3,
+                commit: Some(crate::git::CommitId::new("cafebabe")),
+            },
+            Event::DeferredItemStale {
+                text: "polish error message".into(),
+                attempts: 3,
+            },
+            Event::SweepHalted {
+                after: pid("01"),
+                reason: HaltReason::TestsFailed("boom".into()),
+            },
+            Event::PhaseHalted {
+                phase_id: pid("01"),
+                reason: HaltReason::TestsFailed("boom".into()),
+            },
+            Event::UsageUpdated(TokenUsage::default()),
+            Event::RunFinished,
+        ]
+    }
+
+    /// Structural exhaustiveness: every `Event` variant must appear in
+    /// `one_of_each_event()`. The set of discriminants iterated by
+    /// `EventDiscriminants::iter()` (generated by `strum::EnumDiscriminants`)
+    /// is the source of truth — adding a new variant to `Event` without
+    /// seeding it here trips this assertion at test time, replacing the
+    /// hand-maintained `match` that used to live here.
+    #[test]
+    fn one_of_each_event_covers_every_variant() {
+        use std::collections::HashSet;
+        use strum::IntoEnumIterator;
+
+        let seeded: HashSet<EventDiscriminants> = one_of_each_event()
+            .iter()
+            .map(EventDiscriminants::from)
+            .collect();
+        let expected: HashSet<EventDiscriminants> = EventDiscriminants::iter().collect();
+
+        let missing: Vec<_> = expected.difference(&seeded).collect();
+        assert!(
+            missing.is_empty(),
+            "one_of_each_event() is missing variants: {missing:?}",
+        );
+    }
+
+    #[test]
+    fn dispatch_every_event_variant_in_sequence_updates_state_as_expected() {
+        // Drive one of every Event through `handle_event` and assert the
+        // resulting App-state transitions. Catches a missing arm or an arm
+        // that drops a side-effect.
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        for event in one_of_each_event() {
+            app.handle_event(event);
+        }
+        // The last terminal event was RunFinished — activity ends in Done.
+        assert_eq!(app.activity, Activity::Done);
+        // The DeferredItemStale event seeded the stale list.
+        assert_eq!(app.stale_items.len(), 1);
+        assert_eq!(app.stale_items[0].text, "polish error message");
+        assert_eq!(app.stale_items[0].attempts, 3);
+        // Sweep state was cleared by SweepHalted (and again by RunFinished
+        // not touching it).
+        assert!(app.sweep_state.is_none());
+        // Phase 01 ended up Failed because PhaseHalted was the last
+        // phase-status event we sent for it.
+        assert!(matches!(
+            app.phase_status[&pid("01")],
+            PhaseStatus::Failed(_)
+        ));
+        // Output buffer absorbed at least the commit, sweep, halt, and tests
+        // lines; sanity check we got the expected style markers.
+        let joined: String = app.output_lines().cloned().collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("[commit] phase 01"), "{joined}");
+        assert!(joined.contains("[sweep] after phase 01"), "{joined}");
+        assert!(joined.contains("[sweep] after 01"), "{joined}");
+        assert!(joined.contains("[sweep:halt]"), "{joined}");
+        assert!(joined.contains("[halt] phase 01"), "{joined}");
+        assert!(joined.contains("[tests passed]"), "{joined}");
+        assert!(joined.contains("[tests] no runner detected"), "{joined}");
+    }
+
+    #[test]
+    fn sweep_started_sets_sweep_state_and_sweep_implementer_activity() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::PhaseStarted {
+            phase_id: pid("01"),
+            title: "Project foundation".into(),
+            attempt: 1,
+        });
+        app.handle_event(Event::PhaseCommitted {
+            phase_id: pid("01"),
+            commit: Some(crate::git::CommitId::new("abc1234")),
+        });
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 2,
+            attempt: 2,
+        });
+        let sweep = app.sweep_state.clone().expect("sweep state set");
+        assert_eq!(sweep.after, pid("01"));
+        assert_eq!(sweep.attempt, 2);
+        assert!(!sweep.in_auditor);
+        assert_eq!(app.activity, Activity::SweepImplementer);
+        assert_eq!(app.attempts.get(&pid("01")).copied(), Some(2));
+    }
+
+    #[test]
+    fn sweep_auditor_started_flips_in_auditor_flag() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 2,
+            attempt: 1,
+        });
+        app.handle_event(Event::AuditorStarted {
+            context: AuditContext {
+                phase_id: pid("01"),
+                kind: AuditContextKind::Sweep,
+            },
+            attempt: 2,
+        });
+        let sweep = app.sweep_state.clone().expect("sweep state set");
+        assert!(sweep.in_auditor);
+        assert_eq!(app.activity, Activity::SweepAuditor);
+    }
+
+    #[test]
+    fn sweep_completed_clears_sweep_state_and_logs_resolved_line() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 3,
+            attempt: 1,
+        });
+        app.handle_event(Event::SweepCompleted {
+            after: pid("01"),
+            resolved: 3,
+            commit: Some(crate::git::CommitId::new("cafebabe")),
+        });
+        assert!(app.sweep_state.is_none());
+        let last = app.output.back().unwrap();
+        assert!(last.contains("3 items resolved"), "got: {last}");
+    }
+
+    #[test]
+    fn sweep_halted_clears_sweep_state_and_sets_halted_activity() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 1,
+            attempt: 1,
+        });
+        app.handle_event(Event::SweepHalted {
+            after: pid("01"),
+            reason: HaltReason::TestsFailed("boom".into()),
+        });
+        assert!(app.sweep_state.is_none());
+        assert!(matches!(app.activity, Activity::Halted(_)));
+        let last = app.output.back().unwrap();
+        assert!(last.starts_with("[sweep:halt]"), "got: {last}");
+    }
+
+    #[test]
+    fn phase_started_after_sweep_clears_sweep_state() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 1,
+            attempt: 1,
+        });
+        app.handle_event(Event::PhaseStarted {
+            phase_id: pid("02"),
+            title: "Domain types".into(),
+            attempt: 1,
+        });
+        assert!(app.sweep_state.is_none());
+    }
+
+    #[test]
+    fn deferred_item_stale_event_inserts_and_updates_panel_list() {
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::DeferredItemStale {
+            text: "polish error message".into(),
+            attempts: 3,
+        });
+        app.handle_event(Event::DeferredItemStale {
+            text: "drop unused stub".into(),
+            attempts: 5,
+        });
+        // Re-emit for the same item with a higher count: expected to update
+        // in place and rebubble to the top of the sort.
+        app.handle_event(Event::DeferredItemStale {
+            text: "polish error message".into(),
+            attempts: 6,
+        });
+        assert_eq!(app.stale_items.len(), 2);
+        assert_eq!(app.stale_items[0].text, "polish error message");
+        assert_eq!(app.stale_items[0].attempts, 6);
+        assert_eq!(app.stale_items[1].text, "drop unused stub");
+        assert_eq!(app.stale_items[1].attempts, 5);
+    }
+
+    #[test]
+    fn stale_items_hydrated_from_constructor() {
+        let app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            vec![
+                StaleItem {
+                    text: "polish error message".into(),
+                    attempts: 3,
+                },
+                StaleItem {
+                    text: "drop unused stub".into(),
+                    attempts: 4,
+                },
+            ],
+        );
+        assert_eq!(app.stale_items.len(), 2);
+    }
+
+    #[test]
+    fn out_of_order_sweep_completed_without_started_does_not_panic() {
+        // Defensive: the runner should never emit SweepCompleted before
+        // SweepStarted, but if it did (e.g., a desync from an external
+        // subscriber injecting events in tests), the App must not panic
+        // and must surface a `[tui:warn]` line so the operator notices
+        // (the underlying tracing::debug is invisible under the alternate
+        // screen).
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::SweepCompleted {
+            after: pid("01"),
+            resolved: 0,
+            commit: None,
+        });
+        assert!(app.sweep_state.is_none());
+        let lines: Vec<String> = app.output_lines().cloned().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[tui:warn] SweepCompleted(01) without SweepStarted(01)")),
+            "expected a [tui:warn] line; output was: {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("0 items resolved")),
+            "expected resolved-count line; output was: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn out_of_order_sweep_started_without_phase_committed_does_not_panic() {
+        // Defensive: a SweepStarted before any PhaseCommitted (or a fresh
+        // run with no completed phases) sets sweep_state without panicking,
+        // and surfaces a `[tui:warn]` line so the desync is visible at
+        // runtime instead of buried in `RUST_LOG`.
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state(),
+            fixture_agent(),
+            UsageView::default(),
+            Vec::new(),
+        );
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 1,
+            attempt: 1,
+        });
+        let sweep = app.sweep_state.clone().expect("sweep state set");
+        assert_eq!(sweep.after, pid("01"));
+        let lines: Vec<String> = app.output_lines().cloned().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[tui:warn] SweepStarted(01) without PhaseCommitted(01)")),
+            "expected a [tui:warn] line; output was: {lines:?}",
+        );
+    }
+
+    fn sweep_after_first_phase_apparatus(now_offset_seconds: i64) -> App {
+        let started_at = fixed_started_at();
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state_at(started_at),
+            fixture_agent(),
+            fixture_usage_view(),
+            Vec::new(),
+        );
+        app.set_now(started_at + chrono::Duration::seconds(now_offset_seconds));
+        app.handle_event(Event::PhaseStarted {
+            phase_id: pid("01"),
+            title: "Project foundation".into(),
+            attempt: 1,
+        });
+        app.handle_event(Event::PhaseCommitted {
+            phase_id: pid("01"),
+            commit: Some(crate::git::CommitId::new("abc1234")),
+        });
+        app
+    }
+
+    #[test]
+    fn render_sweep_in_flight() {
+        let mut app = sweep_after_first_phase_apparatus(120);
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 3,
+            attempt: 2,
+        });
+        app.handle_event(Event::AgentStdout("Reading deferred.md".into()));
+        app.handle_event(Event::AgentStdout("Editing src/lib.rs".into()));
+        let snap = render_to_string(&app, 120, 30);
+        insta::assert_snapshot!("sweep_in_flight", snap);
+    }
+
+    #[test]
+    fn render_sweep_auditor() {
+        let mut app = sweep_after_first_phase_apparatus(140);
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 3,
+            attempt: 2,
+        });
+        app.handle_event(Event::AuditorStarted {
+            context: AuditContext {
+                phase_id: pid("01"),
+                kind: AuditContextKind::Sweep,
+            },
+            attempt: 3,
+        });
+        app.handle_event(Event::AgentStdout("Reviewing sweep diff".into()));
+        let snap = render_to_string(&app, 120, 30);
+        insta::assert_snapshot!("sweep_auditor", snap);
+    }
+
+    #[test]
+    fn render_sweep_completed() {
+        let mut app = sweep_after_first_phase_apparatus(180);
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 3,
+            attempt: 2,
+        });
+        app.handle_event(Event::SweepCompleted {
+            after: pid("01"),
+            resolved: 3,
+            commit: Some(crate::git::CommitId::new("def5678")),
+        });
+        let snap = render_to_string(&app, 120, 30);
+        insta::assert_snapshot!("sweep_completed", snap);
+    }
+
+    #[test]
+    fn render_sweep_halted() {
+        let mut app = sweep_after_first_phase_apparatus(200);
+        app.handle_event(Event::SweepStarted {
+            after: pid("01"),
+            items_pending: 2,
+            attempt: 2,
+        });
+        app.handle_event(Event::AuditorStarted {
+            context: AuditContext {
+                phase_id: pid("01"),
+                kind: AuditContextKind::Sweep,
+            },
+            attempt: 3,
+        });
+        app.handle_event(Event::SweepHalted {
+            after: pid("01"),
+            reason: HaltReason::TestsFailed("12 failed".into()),
+        });
+        let snap = render_to_string(&app, 120, 30);
+        insta::assert_snapshot!("sweep_halted", snap);
+    }
+
+    #[test]
+    fn render_stale_items_panel() {
+        let started_at = fixed_started_at();
+        let mut app = App::new(
+            three_phase_plan(),
+            fresh_state_at(started_at),
+            fixture_agent(),
+            fixture_usage_view(),
+            vec![
+                StaleItem {
+                    text: "polish error message in fixer".into(),
+                    attempts: 4,
+                },
+                StaleItem {
+                    text: "drop unused stub from prompts".into(),
+                    attempts: 3,
+                },
+            ],
+        );
+        app.set_now(started_at + chrono::Duration::seconds(300));
+        app.handle_event(Event::PhaseStarted {
+            phase_id: pid("02"),
+            title: "Domain types".into(),
+            attempt: 1,
+        });
+        let snap = render_to_string(&app, 120, 30);
+        insta::assert_snapshot!("stale_items_panel", snap);
     }
 }

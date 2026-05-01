@@ -20,9 +20,14 @@ use anyhow::{Context, Result};
 use crate::config::{self, Config};
 use crate::deferred::{self, DeferredDoc};
 use crate::plan::{self, Plan};
-use crate::runner;
+use crate::runner::{self, sweep::unchecked_count};
 use crate::state::{self, RunState};
 use crate::util::paths;
+
+// Maximum number of stale items to render in `pitboss status`. Shared with
+// the TUI stale panel via [`crate::runner::STALE_ITEMS_DISPLAY_CAP`] so the
+// two operator surfaces stay in lockstep.
+use crate::runner::STALE_ITEMS_DISPLAY_CAP as STALE_DISPLAY_CAP;
 
 /// Top-level entry point for the `status` subcommand. Prints to stdout.
 pub fn run(workspace: PathBuf) -> Result<()> {
@@ -161,6 +166,8 @@ pub fn render_report(
         deferred.phases.len()
     ));
 
+    out.push_str(&render_sweep_block(deferred, state, config, c));
+
     if let Some(s) = state {
         let usage = &s.token_usage;
         out.push_str(&format!(
@@ -192,6 +199,107 @@ pub fn render_report(
     }
 
     out
+}
+
+/// Render the "Sweep" block of the status report.
+///
+/// Always prints the pending / consecutive / item count fields so a fresh
+/// repo with no sweep activity still shows zeros (matches the spec). Stale
+/// items only render when at least one item's sweep-attempt counter has
+/// hit `[sweep] escalate_after`; the list is capped at
+/// [`STALE_DISPLAY_CAP`] entries with a footer line that points the
+/// operator at the recommended remediation paths.
+fn render_sweep_block(
+    deferred: &DeferredDoc,
+    state: Option<&RunState>,
+    config: &Config,
+    c: bool,
+) -> String {
+    use crate::style::{self, col};
+    let lbl = |key: &str| col(c, style::CYAN, key);
+    let dim = |v: &str| col(c, style::DIM, v);
+
+    let pending = state.map(|s| s.pending_sweep).unwrap_or(false);
+    let consecutive = state.map(|s| s.consecutive_sweeps).unwrap_or(0);
+    let unchecked = unchecked_count(deferred);
+    let total_items = deferred.items.len();
+
+    let mut out = String::new();
+    out.push_str(&format!("{}:\n", lbl("Sweep")));
+    out.push_str(&format!(
+        "  {}: {}\n",
+        dim("pending"),
+        if pending {
+            col(c, style::BOLD_YELLOW, "true")
+        } else {
+            "false".to_string()
+        }
+    ));
+    out.push_str(&format!("  {}: {}\n", dim("consecutive"), consecutive));
+    out.push_str(&format!(
+        "  {}: {} unchecked / {} total\n",
+        dim("deferred items"),
+        unchecked,
+        total_items,
+    ));
+
+    let stale = collect_stale_items(state, config);
+    if !stale.is_empty() {
+        let total_stale = state
+            .map(|s| {
+                let escalate = config.sweep.escalate_after.max(1);
+                s.deferred_item_attempts
+                    .values()
+                    .filter(|&&n| n >= escalate)
+                    .count()
+            })
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "  {}: {} {}\n",
+            dim("stale items"),
+            col(c, style::BOLD_YELLOW, &total_stale.to_string()),
+            dim("(need attention)"),
+        ));
+        for (text, attempts) in stale.iter().take(STALE_DISPLAY_CAP) {
+            out.push_str(&format!(
+                "    - \"{}\" {}\n",
+                text,
+                dim(&format!("(tried {attempts} times)")),
+            ));
+        }
+        if stale.len() > STALE_DISPLAY_CAP {
+            out.push_str(&format!(
+                "    {}\n",
+                dim(&format!("… +{} more", stale.len() - STALE_DISPLAY_CAP)),
+            ));
+        }
+        out.push_str(&format!(
+            "    {}\n",
+            dim(
+                "Promote a stale item to a `## Deferred phase` H3 block, rewrite the text, or check it off if obsolete."
+            )
+        ));
+    }
+
+    out
+}
+
+/// Collect stale `## Deferred items` for the status block. Returns
+/// `(text, attempts)` pairs sorted by descending attempts (text ascending
+/// as a deterministic tiebreaker).
+fn collect_stale_items(state: Option<&RunState>, config: &Config) -> Vec<(String, u32)> {
+    let Some(state) = state else {
+        return Vec::new();
+    };
+    let escalate = config.sweep.escalate_after.max(1);
+    let mut items: Vec<(String, u32)> = state
+        .deferred_item_attempts
+        .iter()
+        .filter(|(_, &n)| n >= escalate)
+        .map(|(text, &n)| (text.clone(), n))
+        .collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    items
 }
 
 /// Render the budget block of the status report.
@@ -340,6 +448,10 @@ mod tests {
                 by_role,
             },
             aborted: false,
+            pending_sweep: false,
+            consecutive_sweeps: 0,
+            deferred_item_attempts: HashMap::new(),
+            post_final_phase: false,
         }
     }
 

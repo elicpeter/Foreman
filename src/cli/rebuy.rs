@@ -22,7 +22,24 @@ use super::play::{execute, StartMode};
 /// the resumed run into the post-run `gh pr create` step (see
 /// [`crate::cli::play::run`]). `dry_run` mirrors `pitboss play --dry-run`:
 /// the configured agent is swapped for a no-op so the resumed run can be
-/// exercised end-to-end without spending tokens.
-pub async fn run(workspace: PathBuf, tui: bool, pr: bool, dry_run: bool) -> Result<()> {
-    execute(workspace, tui, pr, dry_run, StartMode::Resume).await
+/// exercised end-to-end without spending tokens. `no_sweep` and
+/// `force_sweep` mirror `pitboss play --no-sweep` / `--sweep`.
+pub async fn run(
+    workspace: PathBuf,
+    tui: bool,
+    pr: bool,
+    dry_run: bool,
+    no_sweep: bool,
+    force_sweep: bool,
+) -> Result<()> {
+    execute(
+        workspace,
+        tui,
+        pr,
+        dry_run,
+        no_sweep,
+        force_sweep,
+        StartMode::Resume,
+    )
+    .await
 }

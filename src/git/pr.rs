@@ -233,6 +233,10 @@ mod tests {
                 by_role,
             },
             aborted: false,
+            pending_sweep: false,
+            consecutive_sweeps: 0,
+            deferred_item_attempts: HashMap::new(),
+            post_final_phase: false,
         }
     }
 

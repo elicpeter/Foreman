@@ -14,8 +14,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::grind::ExitCode;
-
+pub mod exit_code;
 pub mod fold;
 pub mod grind;
 pub mod init;
@@ -25,6 +24,9 @@ pub mod play;
 pub mod prompts;
 pub mod rebuy;
 pub mod status;
+pub mod sweep;
+
+pub use exit_code::ExitCode;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,6 +70,7 @@ impl Cli {
             | Command::Plan { .. }
             | Command::Status
             | Command::Fold { .. }
+            | Command::Sweep(_)
             | Command::Prompts(_) => false,
         }
     }
@@ -111,6 +114,18 @@ pub enum Command {
         /// agent makes no edits.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Suppress deferred sweeps for this run. Clears any inherited
+        /// `pending_sweep` flag at startup and refuses to arm the sweep
+        /// gate from any subsequent phase commit. The override is
+        /// in-memory — `pitboss.toml`'s `[sweep]` block is untouched.
+        #[arg(long = "no-sweep", conflicts_with = "sweep")]
+        no_sweep: bool,
+        /// Force a sweep before the next phase even if the configured
+        /// trigger threshold isn't met. Useful after editing
+        /// `deferred.md` by hand. See `[sweep]` in `.pitboss/config.toml` for the
+        /// thresholds the override bypasses.
+        #[arg(long = "sweep")]
+        sweep: bool,
     },
     /// Print a summary of the current run.
     Status,
@@ -129,6 +144,14 @@ pub enum Command {
         /// Mirrors `pitboss play --dry-run`.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Suppress deferred sweeps for this resumed run. Mirrors
+        /// `pitboss play --no-sweep`.
+        #[arg(long = "no-sweep", conflicts_with = "sweep")]
+        no_sweep: bool,
+        /// Force a sweep before the next phase. Mirrors
+        /// `pitboss play --sweep`.
+        #[arg(long = "sweep")]
+        sweep: bool,
     },
     /// Fold the active run (mark it aborted). `pitboss play` and `pitboss
     /// rebuy` refuse to operate on a folded state. Aliased as `abort` for
@@ -140,6 +163,10 @@ pub enum Command {
         #[arg(long)]
         checkout_original: bool,
     },
+    /// Run a one-shot deferred sweep without advancing the plan. Useful
+    /// after editing `deferred.md` by hand or to drain a backlog ahead of
+    /// the next `pitboss play`.
+    Sweep(sweep::SweepArgs),
     /// Author and inspect grind prompt files (`ls`, `validate`, `new`).
     Prompts(prompts::PromptsArgs),
     /// Rotate through grind prompts, dispatching one session per rotation
@@ -169,18 +196,31 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode> {
             plan::run(std::env::current_dir()?, goal, force, interview).await?;
             Ok(ExitCode::Success)
         }
-        Command::Play { tui, pr, dry_run } => {
-            play::run(std::env::current_dir()?, tui, pr, dry_run).await?;
+        Command::Play {
+            tui,
+            pr,
+            dry_run,
+            no_sweep,
+            sweep,
+        } => {
+            play::run(std::env::current_dir()?, tui, pr, dry_run, no_sweep, sweep).await?;
             Ok(ExitCode::Success)
         }
         Command::Status => {
             status::run(std::env::current_dir()?)?;
             Ok(ExitCode::Success)
         }
-        Command::Rebuy { tui, pr, dry_run } => {
-            rebuy::run(std::env::current_dir()?, tui, pr, dry_run).await?;
+        Command::Rebuy {
+            tui,
+            pr,
+            dry_run,
+            no_sweep,
+            sweep,
+        } => {
+            rebuy::run(std::env::current_dir()?, tui, pr, dry_run, no_sweep, sweep).await?;
             Ok(ExitCode::Success)
         }
+        Command::Sweep(args) => sweep::run(std::env::current_dir()?, args).await,
         Command::Fold { checkout_original } => {
             fold::run(std::env::current_dir()?, checkout_original).await?;
             Ok(ExitCode::Success)

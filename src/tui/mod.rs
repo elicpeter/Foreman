@@ -59,10 +59,11 @@ where
     let state = runner.state().clone();
     let agent_display = build_agent_display(runner.config(), runner.agent().name());
     let usage_view = build_usage_view(runner.config());
+    let stale_items = runner.stale_items();
     let rx = runner.subscribe();
 
     let mut guard = TerminalGuard::setup().context("tui: setting up terminal")?;
-    let app = App::new(plan, state, agent_display, usage_view);
+    let app = App::new(plan, state, agent_display, usage_view, stale_items);
 
     let outcome = tokio::select! {
         biased;
@@ -328,7 +329,7 @@ mod tests {
             fixer_model: "claude-sonnet-4-6".into(),
             auditor_model: "claude-sonnet-4-6".into(),
         };
-        App::new(plan, state, agent_display, UsageView::default())
+        App::new(plan, state, agent_display, UsageView::default(), Vec::new())
     }
 
     #[test]

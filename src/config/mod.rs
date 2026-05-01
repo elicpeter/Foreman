@@ -65,6 +65,10 @@ pub struct Config {
     /// `pitboss grind` defaults. When a plan file leaves `[hooks]` /
     /// `[budgets]` empty, the runner falls back to the values declared here.
     pub grind: GrindConfig,
+    /// Deferred-sweep tunables. Controls whether the runner inserts a sweep
+    /// dispatch between regular phases and how aggressively it does so. A
+    /// missing `[sweep]` section round-trips to [`SweepConfig::default()`].
+    pub sweep: SweepConfig,
 }
 
 /// Model identifiers used for each agent role. Strings are passed verbatim to
@@ -390,6 +394,72 @@ impl Default for GrindConfig {
     }
 }
 
+/// `[sweep]` section — controls the deferred-sweep pass that runs between
+/// regular phases.
+///
+/// The runner sweeps `deferred.md` automatically when its unchecked-item
+/// count crosses [`Self::trigger_min_items`], at most [`Self::max_consecutive`]
+/// times in a row before yielding to a real phase again. The agent picks how
+/// many items to address per dispatch — clamping a 7-easy-fixes sweep to 5
+/// would just defer the rest, so [`Self::trigger_max_items`] is *advisory*:
+/// it documents the expected upper bound rather than gating behavior.
+///
+/// [`Self::escalate_after`] (consumed by the staleness tracker) and
+/// [`Self::audit_enabled`] (consumed by the post-sweep auditor pass) are
+/// declared here so this section is the single source of truth for sweep
+/// tunables; later phases plug their behavior in without growing new sections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SweepConfig {
+    /// Master switch. When `false` the runner never dispatches a sweep
+    /// between phases, regardless of the rest of this section.
+    pub enabled: bool,
+    /// Lower bound on unchecked `## Deferred items` entries that triggers a
+    /// sweep at the next phase boundary.
+    pub trigger_min_items: u32,
+    /// Advisory upper bound — the documented "expected" cap on items the
+    /// sweep agent picks per dispatch. The runner does not enforce this; the
+    /// agent decides how many items to actually address.
+    pub trigger_max_items: u32,
+    /// Maximum number of sweeps the runner may dispatch back-to-back before
+    /// it must run a real phase. Prevents the loop from livelocking on a
+    /// deferred list it can't fully drain.
+    pub max_consecutive: u32,
+    /// Number of consecutive sweep attempts an item may survive before the
+    /// staleness tracker escalates it. Consumed by phase 05.
+    pub escalate_after: u32,
+    /// Whether the auditor pass runs after a sweep dispatch the way it does
+    /// after a regular phase. Consumed by phase 04.
+    pub audit_enabled: bool,
+    /// Whether the runner runs a bounded final-sweep drain loop after the
+    /// final regular phase commits. Independent of [`Self::enabled`] so an
+    /// operator can disable between-phase sweeps while keeping the trailing
+    /// drain on, or vice versa. Consumed by phase 08. To disable the loop
+    /// entirely set this to `false` rather than reducing
+    /// [`Self::final_sweep_max_iterations`] to zero.
+    pub final_sweep_enabled: bool,
+    /// Maximum number of iterations the final-sweep drain loop may run
+    /// before exiting. The loop also exits early when the unchecked-item
+    /// count reaches zero or when an iteration resolves no items
+    /// (no-progress guard). Consumed by phase 08; validation rejects zero.
+    pub final_sweep_max_iterations: u32,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trigger_min_items: 5,
+            trigger_max_items: 8,
+            max_consecutive: 1,
+            escalate_after: 3,
+            audit_enabled: true,
+            final_sweep_enabled: true,
+            final_sweep_max_iterations: 3,
+        }
+    }
+}
+
 /// Per-session transcript retention policy.
 ///
 /// Phase 04 only ships the two end-points of the spectrum so an operator can
@@ -478,6 +548,25 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.grind.hook_timeout_secs == 0 {
         anyhow::bail!("config.toml: [grind] hook_timeout_secs must be >= 1");
     }
+    if cfg.sweep.trigger_min_items < 1 {
+        anyhow::bail!("config.toml: [sweep] trigger_min_items must be >= 1");
+    }
+    if cfg.sweep.trigger_min_items > cfg.sweep.trigger_max_items {
+        anyhow::bail!(
+            "config.toml: [sweep] trigger_min_items ({}) must be <= trigger_max_items ({})",
+            cfg.sweep.trigger_min_items,
+            cfg.sweep.trigger_max_items
+        );
+    }
+    if cfg.sweep.max_consecutive < 1 {
+        anyhow::bail!("config.toml: [sweep] max_consecutive must be >= 1");
+    }
+    if cfg.sweep.escalate_after < 1 {
+        anyhow::bail!("config.toml: [sweep] escalate_after must be >= 1");
+    }
+    if cfg.sweep.final_sweep_max_iterations < 1 {
+        anyhow::bail!("config.toml: [sweep] final_sweep_max_iterations must be >= 1");
+    }
     Ok(())
 }
 
@@ -522,6 +611,16 @@ fn find_unknown_keys(value: &toml::Value) -> Vec<String> {
                 "transcript_retention",
                 "budgets",
                 "hooks",
+            ],
+            "sweep" => &[
+                "enabled",
+                "trigger_min_items",
+                "trigger_max_items",
+                "max_consecutive",
+                "escalate_after",
+                "audit_enabled",
+                "final_sweep_enabled",
+                "final_sweep_max_iterations",
             ],
             _ => {
                 out.push(section.clone());
@@ -581,6 +680,20 @@ mod tests {
         assert_eq!(cfg.grind.transcript_retention, TranscriptRetention::KeepAll);
         assert!(cfg.grind.prompts_dir.is_none());
         assert!(cfg.grind.default_rotation.is_none());
+        // Sweep defaults: enabled with a 5-item trigger and a single sweep
+        // per phase boundary. The advisory upper bound stays at 8 even though
+        // it doesn't gate behavior, so a config dump documents the expected
+        // ceiling.
+        assert_eq!(cfg.sweep, SweepConfig::default());
+        assert!(cfg.sweep.enabled);
+        assert_eq!(cfg.sweep.trigger_min_items, 5);
+        assert_eq!(cfg.sweep.trigger_max_items, 8);
+        assert_eq!(cfg.sweep.max_consecutive, 1);
+        assert_eq!(cfg.sweep.escalate_after, 3);
+        assert!(cfg.sweep.audit_enabled);
+        // Phase 08 final-sweep drain defaults: enabled with a 3-iteration cap.
+        assert!(cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 3);
     }
 
     #[test]
@@ -1104,5 +1217,148 @@ max_parallel = 2
         let err = parse(text).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains("hook_timeout_secs"), "msg: {msg}");
+    }
+}
+
+/// `[sweep]` section parser tests, kept under `pitboss::config::sweep::…` so
+/// they can be filtered with `cargo test config::sweep`.
+#[cfg(test)]
+mod sweep {
+    use super::*;
+
+    #[test]
+    fn missing_section_yields_default() {
+        let cfg = parse("[git]\nbranch_prefix = \"x/\"\n").unwrap();
+        assert_eq!(cfg.sweep, SweepConfig::default());
+    }
+
+    #[test]
+    fn full_section_round_trips() {
+        let text = "
+[sweep]
+enabled = false
+trigger_min_items = 3
+trigger_max_items = 10
+max_consecutive = 2
+escalate_after = 4
+audit_enabled = false
+final_sweep_enabled = false
+final_sweep_max_iterations = 5
+";
+        let cfg = parse(text).unwrap();
+        assert!(!cfg.sweep.enabled);
+        assert_eq!(cfg.sweep.trigger_min_items, 3);
+        assert_eq!(cfg.sweep.trigger_max_items, 10);
+        assert_eq!(cfg.sweep.max_consecutive, 2);
+        assert_eq!(cfg.sweep.escalate_after, 4);
+        assert!(!cfg.sweep.audit_enabled);
+        assert!(!cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 5);
+
+        let value: toml::Value = toml::from_str(text).unwrap();
+        assert!(find_unknown_keys(&value).is_empty());
+    }
+
+    #[test]
+    fn pre_phase_08_section_picks_up_final_sweep_defaults() {
+        // A `pitboss.toml` written before phase 08 has no `final_sweep_*`
+        // keys; the fields must round-trip to their defaults.
+        let text = "
+[sweep]
+enabled = true
+trigger_min_items = 4
+escalate_after = 2
+";
+        let cfg = parse(text).unwrap();
+        assert!(cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 3);
+    }
+
+    #[test]
+    fn final_sweep_max_iterations_zero_is_rejected() {
+        let text = "[sweep]\nfinal_sweep_max_iterations = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("final_sweep_max_iterations"), "msg: {msg}");
+    }
+
+    #[test]
+    fn partial_section_fills_missing_with_defaults() {
+        let text = "
+[sweep]
+trigger_min_items = 7
+";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.sweep.trigger_min_items, 7);
+        // Other fields untouched.
+        assert!(cfg.sweep.enabled);
+        // trigger_max_items default (8) >= the override (7), so this still
+        // satisfies the trigger_min <= trigger_max validator.
+        assert_eq!(cfg.sweep.trigger_max_items, 8);
+        assert_eq!(cfg.sweep.max_consecutive, 1);
+        assert_eq!(cfg.sweep.escalate_after, 3);
+        assert!(cfg.sweep.audit_enabled);
+        assert!(cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 3);
+    }
+
+    #[test]
+    fn unknown_subkey_is_flagged() {
+        let text = "[sweep]\naggressive = true\n";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let unknown = find_unknown_keys(&value);
+        assert!(unknown.contains(&"sweep.aggressive".to_string()));
+    }
+
+    #[test]
+    fn trigger_min_items_zero_is_rejected() {
+        let text = "[sweep]\ntrigger_min_items = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("trigger_min_items"), "msg: {msg}");
+    }
+
+    #[test]
+    fn trigger_min_above_max_is_rejected() {
+        let text = "
+[sweep]
+trigger_min_items = 9
+trigger_max_items = 4
+";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("trigger_min_items"), "msg: {msg}");
+        assert!(msg.contains("trigger_max_items"), "msg: {msg}");
+    }
+
+    #[test]
+    fn max_consecutive_zero_is_rejected() {
+        let text = "[sweep]\nmax_consecutive = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("max_consecutive"), "msg: {msg}");
+    }
+
+    #[test]
+    fn escalate_after_zero_is_rejected() {
+        let text = "[sweep]\nescalate_after = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("escalate_after"), "msg: {msg}");
+    }
+
+    #[test]
+    fn missing_sweep_section_uses_documented_defaults() {
+        // Phase 02 acceptance: a config.toml with no [sweep] section parses
+        // and applies the documented defaults verbatim.
+        let text = "
+[git]
+branch_prefix = \"work/\"
+
+[audit]
+enabled = true
+";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.sweep, SweepConfig::default());
     }
 }

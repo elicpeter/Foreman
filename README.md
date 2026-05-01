@@ -29,6 +29,7 @@ Pitboss is a Rust CLI that drives a coding agent through a multi-phase implement
 - [Quickstart](#quickstart)
 - [Generating a plan](#generating-a-plan)
 - [The run loop](#the-run-loop)
+- [Sweeps: draining the deferred backlog](#sweeps-draining-the-deferred-backlog)
 - [Grind: rotating prompt runner](#grind-rotating-prompt-runner)
 - [Configuration](#configuration)
 - [Agent backends](#agent-backends)
@@ -175,7 +176,7 @@ For each phase in `plan.md`:
 5. Run the project test suite. If it fails, dispatch the **fixer** agent up to `retries.fixer_max_attempts` times.
 6. Stage the diff and dispatch the **auditor** agent (when `audit.enabled = true`). The auditor inlines small fixes and records anything larger in `deferred.md`. Tests run again post-audit.
 7. Commit the staged diff to the per-run branch as `[pitboss] phase <id>: <title>`. The entire `.pitboss/` directory is gitignored, so nothing pitboss writes lands in your commits.
-8. Sweep checked-off deferred items, advance `current_phase` in `plan.md`, persist `state.json`, move on.
+8. Prune checked-off deferred items, advance `current_phase` in `plan.md`, persist `state.json`, move on. If the unchecked-item count is over `[sweep] trigger_min_items`, the next dispatch is a sweep instead of the next phase. See [Sweeps](#sweeps-draining-the-deferred-backlog).
 
 Every retry is bounded. When a budget is exhausted the runner halts with a clear reason and `pitboss rebuy` picks up from the same phase.
 
@@ -185,6 +186,53 @@ Every retry is bounded. When a budget is exhausted the runner halts with a clear
 <div align="center">
   <sub align="center"><i>USD budget tripped mid-phase. Pitboss halts, no commit lands, `pitboss rebuy` picks up from phase 02.</i></sub>
 </div>
+
+## Sweeps: draining the deferred backlog
+
+When the implementer or auditor cannot finish something inside a phase, it lands in `deferred.md` as an unchecked checkbox. Without a way to drain that file the backlog grows forever, the agent re-reads the same items every phase, and small papercuts pile up until they are no longer small. A sweep is a side dispatch between phases that reads the pending list, makes its edits, runs tests, and commits. The plan does not advance.
+
+After every commit the runner counts unchecked items. Once the count reaches `trigger_min_items` (default 5), the next phase boundary becomes a sweep instead of a regular phase. The sweep agent gets a curated prompt with the pending items and a soft cap of `trigger_max_items` (default 8) on how many to address in one pass. The cap is advisory: pitboss sends the full pending list and the agent decides what fits. The sweep commit lands as `[pitboss] sweep after phase <id>`.
+
+After a sweep, the runner re-evaluates the gate. If the count is still over the threshold and `max_consecutive` (default 1) sweeps have not run back-to-back yet, another sweep dispatches. Otherwise the loop returns to the next regular phase. The cap exists so a backlog the agent cannot drain does not livelock the run.
+
+Items that survive a sweep carry a per-item attempt counter. When a counter crosses `escalate_after` (default 3), the auditor flags the item as stale on its next pass so a human can look at it. The counter resets the moment the item gets checked off.
+
+When `audit_enabled` is on (the default), the auditor pass runs after a sweep the same way it runs after a phase. Small fixes get inlined; larger findings are recorded back into `deferred.md`.
+
+After the last regular phase commits, the runner enters a bounded final-sweep loop to drain whatever is left. The loop runs at most `final_sweep_max_iterations` (default 3) iterations and exits early when the unchecked count hits zero or an iteration resolves no items. `final_sweep_enabled` is independent of `enabled`, so you can keep the trailing drain on while disabling between-phase sweeps, or vice versa.
+
+```toml
+[sweep]
+enabled                    = true   # master switch for between-phase sweeps
+trigger_min_items          = 5      # unchecked count that arms the gate
+trigger_max_items          = 8      # advisory cap surfaced to the agent
+max_consecutive            = 1      # back-to-back sweeps before a real phase must run
+escalate_after             = 3      # sweep attempts an item survives before staleness escalation
+audit_enabled              = true   # run the auditor after a sweep, same as after a phase
+final_sweep_enabled        = true   # drain loop after the final regular phase
+final_sweep_max_iterations = 3      # cap on drain-loop iterations
+```
+
+### Manual sweeps
+
+Three ways to override the gate:
+
+```sh
+pitboss sweep                  # one-shot sweep, no plan advancement
+pitboss play --sweep           # next phase boundary is a sweep, threshold ignored
+pitboss play --no-sweep        # suppress sweeps entirely for this run
+```
+
+`pitboss sweep` runs the same pipeline the inter-phase gate dispatches, without touching `current_phase`. Useful after editing `deferred.md` by hand or to drain a backlog ahead of the next `pitboss play`. Flags:
+
+- `--max-items <N>` clamps the prompt's pending list to the first N items in document order. For pathological 100+ item backlogs that would otherwise blow past the agent's effective context. The on-disk file is unchanged; remaining items surface on the next sweep.
+- `--audit` / `--no-audit` overrides `[sweep] audit_enabled` for this invocation only.
+- `--after <phase-id>` overrides the prompt's `after_phase` label. Defaults to the most recently completed phase, or none when no run has started.
+- `--dry-run` swaps the agent for the deterministic no-op, mirroring `pitboss play --dry-run`.
+
+Exit code is 0 on a clean sweep (committed or no changes) and 1 on a halt. State is persisted on the way out so a halted sweep can be retried.
+
+`pitboss play --no-sweep` and `pitboss rebuy --no-sweep` clear any inherited `pending_sweep` flag at startup and refuse to arm the gate from any subsequent commit. The override is in-memory; the `[sweep]` block in `.pitboss/config.toml` is untouched. `--sweep` and `--no-sweep` are mutually exclusive.
 
 ## Grind: rotating prompt runner
 
@@ -237,6 +285,17 @@ max_phase_attempts = 3
 [audit]
 enabled              = true
 small_fix_line_limit = 30   # line threshold separating "inline" from "defer"
+
+# Deferred-item sweeps. See "Sweeps" above for the full picture.
+[sweep]
+enabled                    = true
+trigger_min_items          = 5
+trigger_max_items          = 8
+max_consecutive            = 1
+escalate_after             = 3
+audit_enabled              = true
+final_sweep_enabled        = true
+final_sweep_max_iterations = 3
 
 # Per-run branch and optional PR.
 [git]

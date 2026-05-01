@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -204,6 +206,7 @@ fn git_log_oneline(dir: &Path) -> Vec<String> {
 fn audit_disabled() -> Config {
     let mut c = Config::default();
     c.audit.enabled = false;
+    common::disable_final_sweep(&mut c);
     c
 }
 
@@ -842,14 +845,13 @@ async fn auditor_skipped_when_implementer_only_touched_planning_artifacts() {
         Script::default().write(".pitboss/play/deferred.md", new_deferred.as_bytes())
     ]);
 
-    let (mut runner, _g) = build_runner(
-        dir.path(),
-        ONE_PHASE_PLAN,
-        EMPTY_DEFERRED,
-        Config::default(),
-        agent,
-    )
-    .await;
+    // Single-phase plan: opt out of the trailing drain so this test asserts
+    // only the implementer-only path.
+    let mut cfg = Config::default();
+    common::disable_final_sweep(&mut cfg);
+
+    let (mut runner, _g) =
+        build_runner(dir.path(), ONE_PHASE_PLAN, EMPTY_DEFERRED, cfg, agent).await;
 
     let mut rx = runner.subscribe();
     let collector = tokio::spawn(async move {

@@ -26,11 +26,14 @@
 pub mod caveman;
 
 use crate::deferred::{self, DeferredDoc};
-use crate::plan::{Phase, Plan};
+use crate::plan::{Phase, PhaseId, Plan};
 
 const IMPLEMENTER_TEMPLATE: &str = include_str!("templates/implementer.txt");
 const AUDITOR_TEMPLATE: &str = include_str!("templates/auditor.txt");
 const FIXER_TEMPLATE: &str = include_str!("templates/fixer.txt");
+const SWEEP_TEMPLATE: &str = include_str!("templates/sweep.txt");
+const SWEEP_FIXER_TEMPLATE: &str = include_str!("templates/sweep_fixer.txt");
+const SWEEP_AUDITOR_TEMPLATE: &str = include_str!("templates/sweep_auditor.txt");
 const PLANNER_TEMPLATE: &str = include_str!("templates/planner.txt");
 const QUESTIONER_TEMPLATE: &str = include_str!("templates/questioner.txt");
 
@@ -157,6 +160,191 @@ pub fn fixer_with_deferred(
             ("deferred", &serialize_deferred_for_prompt(deferred)),
         ],
     )
+}
+
+/// Render the sweep auditor prompt. Mirrors [`auditor_with_deferred`] but is
+/// scoped to a deferred-sweep dispatch instead of a plan phase. `resolved` is
+/// the list of `## Deferred items` text the sweep implementer flipped from
+/// `- [ ]` to `- [x]` in this dispatch; `remaining` is the unchecked-item text
+/// still pending after the sweep. `diff` is the staged `git diff --cached`.
+/// `stale_items` is the runner's per-item staleness snapshot — items at or
+/// above [`crate::config::SweepConfig::escalate_after`] — so the auditor can
+/// be more critical about a `- [x]` claim against an item that has resisted
+/// previous sweeps. Empty slice renders a `(none)` marker.
+/// The auditor's contract is "for each resolved item, does the diff actually
+/// do that work? revert anything unrelated."
+pub fn sweep_auditor(input: SweepAuditorPrompt<'_>) -> String {
+    let SweepAuditorPrompt {
+        plan: _,
+        deferred,
+        after,
+        diff,
+        resolved,
+        remaining,
+        stale_items,
+        small_fix_line_limit,
+    } = input;
+    let limit = small_fix_line_limit.to_string();
+    let resolved_block = render_audit_item_list(resolved);
+    let remaining_block = render_audit_item_list(remaining);
+    let stale_block = render_stale_items(stale_items);
+    render(
+        SWEEP_AUDITOR_TEMPLATE,
+        &[
+            ("after", after.as_str()),
+            ("diff", diff),
+            ("resolved", &resolved_block),
+            ("remaining", &remaining_block),
+            ("stale_items", &stale_block),
+            ("deferred", &serialize_deferred_for_prompt(deferred)),
+            ("small_fix_line_limit", &limit),
+        ],
+    )
+}
+
+/// Bundled inputs for [`sweep_auditor`]. Grouped into a struct so the renderer
+/// reads at the call site as named fields rather than a long positional list,
+/// and so the `small_fix_line_limit` field can match
+/// [`crate::config::AuditConfig::small_fix_line_limit`]'s `u32` without a cast.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepAuditorPrompt<'a> {
+    /// Plan threaded through for parity with the phase auditor; today the
+    /// renderer does not consume it directly, but a future template revision
+    /// might want plan-level context (overall goal, prior-phase summaries).
+    pub plan: &'a Plan,
+    pub deferred: &'a DeferredDoc,
+    pub after: &'a PhaseId,
+    pub diff: &'a str,
+    pub resolved: &'a [String],
+    pub remaining: &'a [String],
+    pub stale_items: &'a [StaleItem],
+    pub small_fix_line_limit: u32,
+}
+
+/// Render an item-list block for the sweep auditor prompt. Empty slice maps to
+/// a visible `(none)` marker so the agent isn't tricked by a blank section.
+fn render_audit_item_list(items: &[String]) -> String {
+    if items.is_empty() {
+        return "(none)\n".to_string();
+    }
+    let mut out = String::new();
+    for text in items {
+        out.push_str("- ");
+        out.push_str(text);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the fixer prompt for the deferred-sweep pipeline. Used when a sweep
+/// dispatch fails its post-test step: there is no "current phase" to anchor on
+/// because the implementer was working through `deferred.md` rather than a
+/// plan phase, so the prompt frames the failure around the deferred items the
+/// implementer touched and asks the fixer to keep the patch scoped to that
+/// sweep.
+pub fn fixer_for_sweep(_plan: &Plan, deferred: &DeferredDoc, test_output: &str) -> String {
+    render(
+        SWEEP_FIXER_TEMPLATE,
+        &[
+            ("test_output", test_output),
+            ("deferred", &serialize_deferred_for_prompt(deferred)),
+        ],
+    )
+}
+
+/// One stale `## Deferred items` entry. The runner's staleness tracker (phase
+/// 05) populates this with items that have survived multiple sweep dispatches
+/// without flipping to `- [x]`; phase 02 ships the type so the prompt
+/// renderer's signature is final today and the template can include a
+/// "Stale items" section that renders cleanly with an empty slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleItem {
+    /// The item text (the bytes that follow `- [ ]` on disk). Used to match
+    /// the entry by exact text — sweep agents are forbidden from rewording
+    /// items precisely so this stays a stable identifier.
+    pub text: String,
+    /// Number of consecutive sweep dispatches in which this item appeared
+    /// without being checked off.
+    pub attempts: u32,
+}
+
+/// Render the sweep prompt. The output instructs the agent to drain pending
+/// `## Deferred items` entries, leaving `## Deferred phases`, `plan.md`, and
+/// `.pitboss/` untouched.
+///
+/// `after_phase = Some(id)` flags this as the inter-phase sweep that fired
+/// after `id` completed; `None` covers the standalone-sweep entry point
+/// (`pitboss sweep` with no run in flight, phase 06). `stale_items` is the
+/// staleness tracker's snapshot — empty until phase 05 wires it in, which the
+/// template tolerates by rendering "(none)".
+pub fn sweep(
+    _plan: &Plan,
+    deferred: &DeferredDoc,
+    after_phase: Option<&PhaseId>,
+    stale_items: &[StaleItem],
+) -> String {
+    let pending = render_pending_items(deferred);
+    let stale = render_stale_items(stale_items);
+    // Context and stale-items substitutions are inserted between H2 sections
+    // separated by blank lines in the template, so they must not carry a
+    // trailing newline of their own — that would expand `\n\n` into `\n\n\n`
+    // and produce a double-blank visual seam.
+    let context = match after_phase {
+        Some(id) => format!(
+            "- Most recently completed phase: {id}\n\
+             - `plan.md` is on disk if you need to peek for context, but you must not modify it.",
+        ),
+        None => "- Standalone sweep — no preceding phase to anchor on. Treat the deferred list as the whole job.\n\
+             - `plan.md` is on disk if you need to peek for context, but you must not modify it."
+            .to_string(),
+    };
+    render(
+        SWEEP_TEMPLATE,
+        &[
+            ("deferred_items", &pending),
+            ("stale_items", &stale),
+            ("context", &context),
+        ],
+    )
+}
+
+/// Build the `{deferred_items}` substitution: only `- [ ]` lines from
+/// `## Deferred items`. Already-checked items are stripped so the agent's
+/// view is exactly the work still pending.
+fn render_pending_items(doc: &DeferredDoc) -> String {
+    let mut out = String::new();
+    for item in &doc.items {
+        if item.done {
+            continue;
+        }
+        out.push_str("- [ ] ");
+        out.push_str(&item.text);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        return "(no pending items)\n".to_string();
+    }
+    out
+}
+
+/// Build the `{stale_items}` substitution. Empty slice → `(none)` so the
+/// section renders cleanly today (phase 05 supplies real values). The result
+/// has no trailing newline; the template provides the blank line that
+/// separates this section from the next.
+fn render_stale_items(items: &[StaleItem]) -> String {
+    if items.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        // The text comes straight from `deferred.md`; wrapping it in backticks
+        // keeps any markdown characters in the original from re-rendering.
+        lines.push(format!(
+            "- `{}` — {} sweep attempts without resolution",
+            item.text, item.attempts
+        ));
+    }
+    lines.join("\n")
 }
 
 fn serialize_deferred_for_prompt(doc: &DeferredDoc) -> String {
@@ -411,6 +599,9 @@ mod tests {
             ("implementer", IMPLEMENTER_TEMPLATE),
             ("auditor", AUDITOR_TEMPLATE),
             ("fixer", FIXER_TEMPLATE),
+            ("sweep", SWEEP_TEMPLATE),
+            ("sweep_fixer", SWEEP_FIXER_TEMPLATE),
+            ("sweep_auditor", SWEEP_AUDITOR_TEMPLATE),
             ("planner", PLANNER_TEMPLATE),
             ("questioner", QUESTIONER_TEMPLATE),
         ] {
@@ -469,5 +660,374 @@ mod tests {
         let goal = "Add a --interview flag to pitboss plan.";
         let repo_summary = "(empty repository)";
         insta::assert_snapshot!(questioner(goal, repo_summary, 25));
+    }
+}
+
+/// Tests for the deferred-sweep prompt and its `sweep_fixer` companion. Kept
+/// in their own module so they show up under `pitboss::prompts::sweep::…` and
+/// can be filtered with `cargo test prompts::sweep`.
+#[cfg(test)]
+mod sweep {
+    use super::*;
+    use crate::deferred::{DeferredItem, DeferredPhase};
+    use crate::plan::PhaseId;
+
+    fn pid(s: &str) -> PhaseId {
+        PhaseId::parse(s).unwrap()
+    }
+
+    fn fixture_plan() -> Plan {
+        Plan::new(
+            pid("03"),
+            vec![
+                Phase {
+                    id: pid("02"),
+                    title: "Sweep prompt scaffolding".into(),
+                    body: "\n**Scope.** wire the prompt.\n".into(),
+                },
+                Phase {
+                    id: pid("03"),
+                    title: "Inter-phase sweep".into(),
+                    body: "\n**Scope.** dispatch the sweep agent.\n".into(),
+                },
+            ],
+        )
+    }
+
+    fn fixture_deferred() -> DeferredDoc {
+        DeferredDoc {
+            items: vec![
+                DeferredItem {
+                    text: "polish error message in PhaseId::parse".into(),
+                    done: false,
+                },
+                DeferredItem {
+                    text: "drop unused stub in deferred::parse".into(),
+                    done: false,
+                },
+                DeferredItem {
+                    text: "rename `flag` to `enabled` in audit config".into(),
+                    done: false,
+                },
+                DeferredItem {
+                    text: "tighten test for empty deferred.md".into(),
+                    done: false,
+                },
+                DeferredItem {
+                    text: "document sweep section in README".into(),
+                    done: false,
+                },
+                DeferredItem {
+                    text: "remove already-shipped TODO in runner".into(),
+                    done: true,
+                },
+            ],
+            phases: vec![DeferredPhase {
+                source_phase: pid("07"),
+                title: "rework agent trait".into(),
+                body: "\nbody line\n".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn sweep_strips_already_checked_items() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let out = sweep(&plan, &deferred, Some(&after), &[]);
+        assert!(
+            !out.contains("remove already-shipped TODO in runner"),
+            "checked items must not appear in the agent's view"
+        );
+        // Five pending items: each one shows up as a `- [ ]` line.
+        for text in [
+            "polish error message in PhaseId::parse",
+            "drop unused stub in deferred::parse",
+            "rename `flag` to `enabled` in audit config",
+            "tighten test for empty deferred.md",
+            "document sweep section in README",
+        ] {
+            assert!(
+                out.contains(&format!("- [ ] {text}")),
+                "expected pending item {text:?} in output:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_renders_after_phase_context() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let out = sweep(&plan, &deferred, Some(&after), &[]);
+        assert!(
+            out.contains("Most recently completed phase: 02"),
+            "expected after_phase context line in output:\n{out}"
+        );
+        assert!(
+            !out.contains("Standalone sweep"),
+            "standalone wording must not appear when after_phase is Some:\n{out}"
+        );
+        // Hard rules mention the H3 / phases prohibition.
+        assert!(out.contains("`### From phase X:`"));
+        // No unsubstituted placeholders.
+        assert!(!out.contains("{deferred_items}"));
+        assert!(!out.contains("{stale_items}"));
+        assert!(!out.contains("{context}"));
+    }
+
+    #[test]
+    fn sweep_renders_standalone_when_after_phase_is_none() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let out = sweep(&plan, &deferred, None, &[]);
+        assert!(
+            out.contains("Standalone sweep"),
+            "expected standalone wording when after_phase is None:\n{out}"
+        );
+        assert!(
+            !out.contains("Most recently completed phase"),
+            "phase-anchor wording must not appear in the standalone case:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sweep_renders_empty_stale_section_with_marker() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let out = sweep(&plan, &deferred, Some(&after), &[]);
+        // Phase 02 ships the section as a placeholder; an empty slice must
+        // render visibly so the agent isn't tricked by a blank section.
+        assert!(out.contains("# Stale items"));
+        assert!(
+            out.contains("(none)"),
+            "empty stale slice should render the visible placeholder:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sweep_renders_stale_items_when_provided() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let stale = vec![
+            StaleItem {
+                text: "polish error message in PhaseId::parse".into(),
+                attempts: 3,
+            },
+            StaleItem {
+                text: "tighten test for empty deferred.md".into(),
+                attempts: 2,
+            },
+        ];
+        let out = sweep(&plan, &deferred, Some(&after), &stale);
+        assert!(out.contains("polish error message in PhaseId::parse"));
+        assert!(
+            out.contains("3 sweep attempts"),
+            "expected stale-attempt count in output:\n{out}"
+        );
+        assert!(out.contains("2 sweep attempts"));
+        assert!(
+            !out.contains("(none)"),
+            "stale-empty marker must not appear when stale items were supplied:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sweep_with_no_pending_items_renders_marker() {
+        let plan = fixture_plan();
+        let deferred = DeferredDoc {
+            items: vec![DeferredItem {
+                text: "already done".into(),
+                done: true,
+            }],
+            phases: Vec::new(),
+        };
+        let after = pid("02");
+        let out = sweep(&plan, &deferred, Some(&after), &[]);
+        assert!(
+            out.contains("(no pending items)"),
+            "expected pending-empty marker:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sweep_template_static_size_under_budget_for_empty_inputs() {
+        // The template is what we ship in source; this guards against a future
+        // edit ballooning it past the per-template ceiling. Render with the
+        // smallest possible inputs so we measure the static portion.
+        let plan = fixture_plan();
+        let out = sweep(&plan, &DeferredDoc::empty(), None, &[]);
+        assert!(
+            out.len() <= TEMPLATE_STATIC_BUDGET,
+            "rendered sweep prompt is {} bytes for empty inputs (> budget {})",
+            out.len(),
+            TEMPLATE_STATIC_BUDGET
+        );
+    }
+
+    #[test]
+    fn snapshot_sweep_after_phase() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        insta::assert_snapshot!(sweep(&plan, &deferred, Some(&after), &[]));
+    }
+
+    #[test]
+    fn snapshot_sweep_after_phase_with_stale_items() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let stale = vec![
+            StaleItem {
+                text: "polish error message in PhaseId::parse".into(),
+                attempts: 3,
+            },
+            StaleItem {
+                text: "tighten test for empty deferred.md".into(),
+                attempts: 2,
+            },
+        ];
+        insta::assert_snapshot!(sweep(&plan, &deferred, Some(&after), &stale));
+    }
+
+    #[test]
+    fn snapshot_sweep_standalone() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        insta::assert_snapshot!(sweep(&plan, &deferred, None, &[]));
+    }
+
+    #[test]
+    fn sweep_auditor_renders_resolved_and_remaining() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n@@\n-old\n+new\n";
+        let resolved = vec![
+            "polish error message in PhaseId::parse".to_string(),
+            "drop unused stub in deferred::parse".to_string(),
+        ];
+        let remaining = vec![
+            "rename `flag` to `enabled` in audit config".to_string(),
+            "tighten test for empty deferred.md".to_string(),
+            "document sweep section in README".to_string(),
+        ];
+        let out = sweep_auditor(SweepAuditorPrompt {
+            plan: &plan,
+            deferred: &deferred,
+            after: &after,
+            diff,
+            resolved: &resolved,
+            remaining: &remaining,
+            stale_items: &[],
+            small_fix_line_limit: 25,
+        });
+        assert!(out.contains("polish error message in PhaseId::parse"));
+        assert!(out.contains("rename `flag` to `enabled` in audit config"));
+        assert!(out.contains("Most recently completed phase: 02"));
+        assert!(out.contains("≤ 25 lines") || out.contains("25 lines"));
+        assert!(out.contains("-old\n+new"));
+        assert!(!out.contains("{resolved}"));
+        assert!(!out.contains("{remaining}"));
+        assert!(!out.contains("{after}"));
+        assert!(!out.contains("{diff}"));
+        assert!(!out.contains("{stale_items}"));
+    }
+
+    #[test]
+    fn sweep_auditor_renders_stale_items_when_provided() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let stale = vec![StaleItem {
+            text: "polish error message in PhaseId::parse".into(),
+            attempts: 4,
+        }];
+        let out = sweep_auditor(SweepAuditorPrompt {
+            plan: &plan,
+            deferred: &deferred,
+            after: &after,
+            diff: "(empty diff)",
+            resolved: &[],
+            remaining: &[],
+            stale_items: &stale,
+            small_fix_line_limit: 25,
+        });
+        assert!(
+            out.contains("Stale items"),
+            "expected stale items section header in output:\n{out}"
+        );
+        assert!(
+            out.contains("4 sweep attempts"),
+            "expected stale-attempt count in sweep_auditor output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sweep_auditor_renders_empty_lists_with_marker() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let out = sweep_auditor(SweepAuditorPrompt {
+            plan: &plan,
+            deferred: &deferred,
+            after: &after,
+            diff: "(empty diff)",
+            resolved: &[],
+            remaining: &[],
+            stale_items: &[],
+            small_fix_line_limit: 30,
+        });
+        // Empty resolved/remaining/stale each render with a `(none)` marker.
+        assert!(
+            out.matches("(none)").count() >= 3,
+            "expected (none) markers for resolved, remaining, and stale:\n{out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_sweep_auditor() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let after = pid("02");
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n@@\n-old\n+new\n";
+        let resolved = vec![
+            "polish error message in PhaseId::parse".to_string(),
+            "drop unused stub in deferred::parse".to_string(),
+        ];
+        let remaining = vec![
+            "rename `flag` to `enabled` in audit config".to_string(),
+            "tighten test for empty deferred.md".to_string(),
+            "document sweep section in README".to_string(),
+        ];
+        insta::assert_snapshot!(sweep_auditor(SweepAuditorPrompt {
+            plan: &plan,
+            deferred: &deferred,
+            after: &after,
+            diff,
+            resolved: &resolved,
+            remaining: &remaining,
+            stale_items: &[],
+            small_fix_line_limit: 30,
+        }));
+    }
+
+    #[test]
+    fn snapshot_sweep_fixer() {
+        let plan = fixture_plan();
+        let deferred = fixture_deferred();
+        let test_output = "running 4 tests\n\
+            test sweep_strips_already_checked_items ... ok\n\
+            test sweep_renders_after_phase_context ... ok\n\
+            test sweep_renders_empty_stale_section_with_marker ... FAILED\n\
+            test sweep_renders_standalone_when_after_phase_is_none ... ok\n\n\
+            failures:\n\n\
+            ---- sweep_renders_empty_stale_section_with_marker stdout ----\n\
+            assertion failed: out.contains(\"(none)\")\n";
+        insta::assert_snapshot!(fixer_for_sweep(&plan, &deferred, test_output));
     }
 }
