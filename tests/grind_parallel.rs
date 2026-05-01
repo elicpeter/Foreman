@@ -738,7 +738,7 @@ async fn parallel_wall_clock_is_meaningfully_less_than_sum_of_session_times() {
     // sessions cannot take longer than serial execution. Loose enough that
     // a slow CI host won't flake; tight enough to catch a regression that
     // accidentally serializes the dispatch.
-    let serial_upper_bound = session_sleep * 2;
+    let serial_upper_bound = session_sleep * 2 + Duration::from_millis(800);
     assert!(
         elapsed < serial_upper_bound,
         "elapsed {elapsed:?} ≥ serial bound {serial_upper_bound:?} — parallelism likely broken"

@@ -16,6 +16,8 @@
 //! implementer's diff, hands it to the auditor agent, re-validates the
 //! planning artifacts, and re-runs the tests before letting the commit land.
 
+pub mod sweep;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -422,91 +424,34 @@ impl<A: Agent, G: Git> Runner<A, G> {
 
         let plan_path = paths::plan_path(&self.workspace);
         let deferred_path = paths::deferred_path(&self.workspace);
-
-        let user_prompt = prompts::implementer(&self.plan, &self.deferred, &phase);
-        let log_path = self.attempt_log_path(&phase_id, "implementer", attempt);
-        let request = AgentRequest {
-            role: Role::Implementer,
-            model: self.config.models.implementer.clone(),
-            system_prompt: prompts::caveman::system_prompt(&self.config.caveman),
-            user_prompt,
-            workdir: self.workspace.clone(),
-            log_path,
-            timeout: DEFAULT_AGENT_TIMEOUT,
-            env: std::collections::HashMap::new(),
-        };
-
-        match self
-            .dispatch_and_validate(request, Role::Implementer, &plan_path, &deferred_path)
-            .await?
-        {
-            ValidationResult::Continue => {}
-            ValidationResult::Halt(reason) => return Ok(PhaseResult::Halted { phase_id, reason }),
-        }
-
-        let test_runner = if self.skip_tests {
-            debug!("dry-run: skipping test detection and execution");
-            None
-        } else {
-            project_tests::detect(&self.workspace, self.config.tests.command.as_deref())
-        };
-        if let Some(runner) = &test_runner {
-            let outcome = self.run_tests(runner, &phase_id, "tests", attempt).await?;
-            if !outcome.passed {
-                match self
-                    .run_fixer_loop(&phase, runner, &plan_path, &deferred_path, outcome.summary)
-                    .await?
-                {
-                    FixerLoopResult::Passed => {}
-                    FixerLoopResult::Halted(reason) => {
-                        return Ok(PhaseResult::Halted { phase_id, reason })
-                    }
-                }
-            }
-        } else {
-            if !self.skip_tests {
-                debug!("no test runner detected and no override configured; skipping tests");
-            }
-            let _ = self.events_tx.send(Event::TestsSkipped);
-        }
-
         // Every pitboss artifact lives under `.pitboss/`, which is gitignored,
-        // so a single exclude entry covers plan.md, deferred.md, state.json,
-        // logs, snapshots, grind state, etc.
-        let pitboss_rel = Path::new(".pitboss");
+        // so one exclude entry covers plan.md, deferred.md, state.json, logs,
+        // snapshots, grind state, etc.
+        let exclude: [&Path; 1] = [Path::new(".pitboss")];
 
-        match self
-            .run_auditor_pass(
-                &phase,
-                test_runner.as_ref(),
-                &plan_path,
-                &deferred_path,
-                &[pitboss_rel],
-            )
-            .await?
-        {
-            AuditPassResult::Continue => {}
-            AuditPassResult::Halted(reason) => return Ok(PhaseResult::Halted { phase_id, reason }),
-        }
+        let spec = DispatchSpec {
+            request: self.implementer_request(&phase, attempt),
+            phase_id: phase_id.clone(),
+            phase: Some(&phase),
+            plan_path: &plan_path,
+            deferred_path: &deferred_path,
+            exclude_paths: &exclude,
+            audit: self
+                .config
+                .audit
+                .enabled
+                .then_some(AuditKind::Phase { phase: &phase }),
+        };
 
-        // Re-stage to capture anything the auditor added or modified. When the
-        // auditor was skipped (disabled, or no code changes to audit) this is
-        // the first stage call of the phase.
-        self.git
-            .stage_changes(&[pitboss_rel])
-            .await
-            .context("runner: staging code-only changes")?;
+        let has_changes = match self.run_dispatch_pipeline(spec).await? {
+            PipelineOutcome::Halted(reason) => return Ok(PhaseResult::Halted { phase_id, reason }),
+            PipelineOutcome::Staged { has_changes } => has_changes,
+        };
 
-        let commit = if self
-            .git
-            .has_staged_changes()
-            .await
-            .context("runner: checking for staged changes")?
-        {
-            let message = git::commit_message(&phase_id, &phase.title);
+        let commit = if has_changes {
             let id = self
                 .git
-                .commit(&message)
+                .commit(&git::commit_message(&phase_id, &phase.title))
                 .await
                 .context("runner: committing phase")?;
             Some(id)
@@ -516,8 +461,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
         };
 
         self.deferred.sweep();
-        let deferred_serialized = deferred::serialize(&self.deferred);
-        write_atomic(&deferred_path, deferred_serialized.as_bytes())
+        write_atomic(&deferred_path, deferred::serialize(&self.deferred).as_bytes())
             .context("runner: writing deferred.md after sweep")?;
 
         self.state.completed.push(phase_id.clone());
@@ -525,8 +469,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
         let next_phase = self.next_phase_id_after(&phase_id);
         if let Some(ref next) = next_phase {
             self.plan.set_current_phase(next.clone());
-            let plan_serialized = plan::serialize(&self.plan);
-            write_atomic(&plan_path, plan_serialized.as_bytes())
+            write_atomic(&plan_path, plan::serialize(&self.plan).as_bytes())
                 .context("runner: writing plan.md with advanced current_phase")?;
         }
 
@@ -542,6 +485,123 @@ impl<A: Agent, G: Git> Runner<A, G> {
             next_phase,
             commit,
         })
+    }
+
+    /// Build the implementer [`AgentRequest`] for `phase`. `attempt` is the
+    /// 1-based dispatch counter the caller pulled from [`bump_attempts`]; it
+    /// flows into the per-attempt log filename so a fixer re-dispatch later in
+    /// the phase does not clobber the implementer's log.
+    fn implementer_request(&self, phase: &crate::plan::Phase, attempt: u32) -> AgentRequest {
+        AgentRequest {
+            role: Role::Implementer,
+            model: self.config.models.implementer.clone(),
+            system_prompt: prompts::caveman::system_prompt(&self.config.caveman),
+            user_prompt: prompts::implementer(&self.plan, &self.deferred, phase),
+            workdir: self.workspace.clone(),
+            log_path: self.attempt_log_path(&phase.id, "implementer", attempt),
+            timeout: DEFAULT_AGENT_TIMEOUT,
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Drive the dispatch → validate → tests → fixer → optional auditor → stage
+    /// chain for one already-built [`AgentRequest`]. The caller is responsible
+    /// for bumping the attempts counter and emitting the "started" event for
+    /// the dispatch type before invoking this; on return either a halt reason
+    /// is surfaced or the working tree has been staged and `has_changes`
+    /// indicates whether anything outside `exclude_paths` ended up in the
+    /// index. Phase 03 reuses this helper from a sweep entry point, which is
+    /// why the caller — not the helper — owns the commit decision.
+    async fn run_dispatch_pipeline(&mut self, spec: DispatchSpec<'_>) -> Result<PipelineOutcome> {
+        let DispatchSpec {
+            request,
+            phase_id,
+            phase,
+            plan_path,
+            deferred_path,
+            exclude_paths,
+            audit,
+        } = spec;
+
+        let role = request.role;
+        match self
+            .dispatch_and_validate(request, role, plan_path, deferred_path)
+            .await?
+        {
+            ValidationResult::Continue => {}
+            ValidationResult::Halt(reason) => return Ok(PipelineOutcome::Halted(reason)),
+        }
+
+        let test_runner = if self.skip_tests {
+            debug!("dry-run: skipping test detection and execution");
+            None
+        } else {
+            project_tests::detect(&self.workspace, self.config.tests.command.as_deref())
+        };
+        if let Some(runner) = &test_runner {
+            // The post-dispatch test log shares the agent's attempt number so
+            // operators can pair them up at a glance. `bump_attempts` was
+            // called by the caller before building `request`, so reading
+            // state.attempts here yields exactly that attempt.
+            let attempt = self.state.attempts.get(&phase_id).copied().unwrap_or(0);
+            let outcome = self.run_tests(runner, &phase_id, "tests", attempt).await?;
+            if !outcome.passed {
+                match self
+                    .run_fixer_loop(
+                        &phase_id,
+                        phase,
+                        runner,
+                        plan_path,
+                        deferred_path,
+                        outcome.summary,
+                    )
+                    .await?
+                {
+                    FixerLoopResult::Passed => {}
+                    FixerLoopResult::Halted(reason) => {
+                        return Ok(PipelineOutcome::Halted(reason));
+                    }
+                }
+            }
+        } else {
+            if !self.skip_tests {
+                debug!("no test runner detected and no override configured; skipping tests");
+            }
+            let _ = self.events_tx.send(Event::TestsSkipped);
+        }
+
+        if let Some(audit) = audit {
+            match self
+                .run_auditor_pass(
+                    audit,
+                    test_runner.as_ref(),
+                    plan_path,
+                    deferred_path,
+                    exclude_paths,
+                    &phase_id,
+                )
+                .await?
+            {
+                AuditPassResult::Continue => {}
+                AuditPassResult::Halted(reason) => return Ok(PipelineOutcome::Halted(reason)),
+            }
+        }
+
+        // Re-stage to capture anything the auditor added or modified. When the
+        // auditor was skipped (disabled, or no code changes to audit) this is
+        // the first stage call of the phase.
+        self.git
+            .stage_changes(exclude_paths)
+            .await
+            .context("runner: staging code-only changes")?;
+
+        let has_changes = self
+            .git
+            .has_staged_changes()
+            .await
+            .context("runner: checking for staged changes")?;
+
+        Ok(PipelineOutcome::Staged { has_changes })
     }
 
     /// Compare the running [`RunState::token_usage`] against the configured
@@ -712,7 +772,8 @@ impl<A: Agent, G: Git> Runner<A, G> {
     /// [`HaltReason::TestsFailed`].
     async fn run_fixer_loop(
         &mut self,
-        phase: &crate::plan::Phase,
+        phase_id: &PhaseId,
+        phase: Option<&crate::plan::Phase>,
         test_runner: &project_tests::TestRunner,
         plan_path: &Path,
         deferred_path: &Path,
@@ -725,23 +786,29 @@ impl<A: Agent, G: Git> Runner<A, G> {
             )));
         }
 
-        let phase_id = phase.id.clone();
         let mut last_summary = initial_summary;
 
         for fixer_attempt in 1..=budget {
             if let Some(reason) = self.check_budget() {
                 return Ok(FixerLoopResult::Halted(reason));
             }
-            let total_attempt = self.bump_attempts(&phase_id);
+            let total_attempt = self.bump_attempts(phase_id);
             let _ = self.events_tx.send(Event::FixerStarted {
                 phase_id: phase_id.clone(),
                 fixer_attempt,
                 attempt: total_attempt,
             });
 
-            let user_prompt =
-                prompts::fixer_with_deferred(&self.plan, phase, &last_summary, &self.deferred);
-            let log_path = self.attempt_log_path(&phase_id, "fix", fixer_attempt);
+            let user_prompt = match phase {
+                Some(p) => prompts::fixer_with_deferred(
+                    &self.plan,
+                    p,
+                    &last_summary,
+                    &self.deferred,
+                ),
+                None => prompts::fixer_for_sweep(&self.plan, &self.deferred, &last_summary),
+            };
+            let log_path = self.attempt_log_path(phase_id, "fix", fixer_attempt);
             let request = AgentRequest {
                 role: Role::Fixer,
                 model: self.config.models.fixer.clone(),
@@ -762,7 +829,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
             }
 
             let outcome = self
-                .run_tests(test_runner, &phase_id, "tests", total_attempt)
+                .run_tests(test_runner, phase_id, "tests", total_attempt)
                 .await?;
             if outcome.passed {
                 return Ok(FixerLoopResult::Passed);
@@ -775,8 +842,11 @@ impl<A: Agent, G: Git> Runner<A, G> {
         )))
     }
 
-    /// Run the auditor agent, gated on
-    /// [`crate::config::AuditConfig::enabled`].
+    /// Run the auditor agent. Gating on
+    /// [`crate::config::AuditConfig::enabled`] is the caller's responsibility:
+    /// [`Runner::run_dispatch_pipeline`] only invokes this helper when its
+    /// `audit` field is `Some`, so callers that build the spec without
+    /// populating `audit` get the disabled-by-default behavior for free.
     ///
     /// Slots in after the test suite (and any fixer dispatches) passes and
     /// before the per-phase commit. The runner stages the implementer's code
@@ -790,18 +860,13 @@ impl<A: Agent, G: Git> Runner<A, G> {
     /// breaking the build deserves operator attention.
     async fn run_auditor_pass(
         &mut self,
-        phase: &crate::plan::Phase,
+        audit: AuditKind<'_>,
         test_runner: Option<&project_tests::TestRunner>,
         plan_path: &Path,
         deferred_path: &Path,
         exclude: &[&Path],
+        phase_id: &PhaseId,
     ) -> Result<AuditPassResult> {
-        if !self.config.audit.enabled {
-            return Ok(AuditPassResult::Continue);
-        }
-
-        let phase_id = phase.id.clone();
-
         // Stage so we can sample the diff. `stage_changes` is idempotent so
         // calling it again post-audit picks up anything the auditor adds.
         self.git
@@ -825,23 +890,25 @@ impl<A: Agent, G: Git> Runner<A, G> {
             return Ok(AuditPassResult::Halted(reason));
         }
 
-        let total_attempt = self.bump_attempts(&phase_id);
+        let total_attempt = self.bump_attempts(phase_id);
         let _ = self.events_tx.send(Event::AuditorStarted {
             phase_id: phase_id.clone(),
             attempt: total_attempt,
         });
 
-        let user_prompt = prompts::auditor_with_deferred(
-            &self.plan,
-            phase,
-            &diff,
-            &self.deferred,
-            self.config.audit.small_fix_line_limit,
-        );
+        let user_prompt = match audit {
+            AuditKind::Phase { phase } => prompts::auditor_with_deferred(
+                &self.plan,
+                phase,
+                &diff,
+                &self.deferred,
+                self.config.audit.small_fix_line_limit,
+            ),
+        };
         // Auditor only ever runs once per phase, so the per-role attempt
         // counter in the log filename stays at 1; the global `attempt`
         // counter still bumps so [`RunState::attempts`] reflects the spend.
-        let log_path = self.attempt_log_path(&phase_id, "audit", 1);
+        let log_path = self.attempt_log_path(phase_id, "audit", 1);
         let request = AgentRequest {
             role: Role::Auditor,
             model: self.config.models.auditor.clone(),
@@ -863,7 +930,7 @@ impl<A: Agent, G: Git> Runner<A, G> {
 
         if let Some(test_runner) = test_runner {
             let outcome = self
-                .run_tests(test_runner, &phase_id, "tests", total_attempt)
+                .run_tests(test_runner, phase_id, "tests", total_attempt)
                 .await?;
             if !outcome.passed {
                 return Ok(AuditPassResult::Halted(HaltReason::TestsFailed(
@@ -969,12 +1036,78 @@ enum FixerLoopResult {
 }
 
 /// Outcome of [`Runner::run_auditor_pass`]. `Continue` covers all the keep-
-/// going cases (audit disabled, no diff to audit, audit ran and tests still
-/// pass); `Halted` carries an agent-side failure, a planning-artifact tamper,
-/// or post-audit test breakage.
+/// going cases (no diff to audit, audit ran and tests still pass); `Halted`
+/// carries an agent-side failure, a planning-artifact tamper, or post-audit
+/// test breakage. The "audit disabled" case is handled upstream by
+/// [`Runner::run_dispatch_pipeline`] only invoking the auditor when the spec
+/// carries an [`AuditKind`].
 enum AuditPassResult {
     Continue,
     Halted(HaltReason),
+}
+
+/// Inputs to [`Runner::run_dispatch_pipeline`]. The pipeline is the shared
+/// dispatch → validate → tests → fixer → optional auditor → stage chain that
+/// both the per-phase implementer dispatch (today) and the per-sweep
+/// implementer dispatch (phase 03) hand off to. Lifetimes tie everything to
+/// the caller's stack frame so the caller keeps ownership of the source
+/// [`crate::plan::Phase`] and path buffers.
+struct DispatchSpec<'a> {
+    /// The pre-built agent request to dispatch first. The caller is
+    /// responsible for having bumped [`RunState::attempts`] for `phase_id`
+    /// before constructing this so the request's `log_path` reflects the
+    /// dispatch's attempt number.
+    request: AgentRequest,
+    /// Phase id under which this dispatch is recorded — drives the fixer
+    /// loop's attempt tracking, the auditor's "started" event, and the
+    /// post-dispatch test log filename. For phase-driven dispatches this is
+    /// the current phase. For sweep dispatches (phase 03) this is the most
+    /// recently completed `after_phase`, since `state.attempts` keys on real
+    /// phase ids.
+    phase_id: PhaseId,
+    /// The current phase, when there is one. The fixer loop uses this to
+    /// render `prompts::fixer_with_deferred`; sweep dispatches pass `None` to
+    /// fall back to `prompts::fixer_for_sweep`.
+    phase: Option<&'a crate::plan::Phase>,
+    /// Path to `plan.md` for snapshot validation.
+    plan_path: &'a Path,
+    /// Path to `deferred.md` for snapshot + parse validation.
+    deferred_path: &'a Path,
+    /// Paths to exclude from `git add` so planning artifacts under
+    /// `.pitboss/` never end up in the per-phase commit.
+    exclude_paths: &'a [&'a Path],
+    /// Whether to run the auditor pass after tests pass. `None` skips the
+    /// auditor entirely; `Some(kind)` selects the prompt variant.
+    audit: Option<AuditKind<'a>>,
+}
+
+/// Selects the auditor prompt variant.
+///
+/// Phase 04 extends this with a `Sweep` variant that drives a sweep-specific
+/// auditor prompt; for now `Phase` is the only constructor and behaves
+/// identically to the pre-refactor auditor pass.
+enum AuditKind<'a> {
+    /// Audit a regular plan-phase implementer dispatch. Renders
+    /// [`crate::prompts::auditor_with_deferred`] for the carried phase.
+    Phase {
+        /// The phase whose implementer diff is under review.
+        phase: &'a crate::plan::Phase,
+    },
+}
+
+/// Outcome of [`Runner::run_dispatch_pipeline`]. The pipeline never commits;
+/// `Staged { has_changes }` hands back whether the staged index is non-empty
+/// so the caller (today: [`Runner::run_phase_inner`]) can decide whether to
+/// commit.
+enum PipelineOutcome {
+    Halted(HaltReason),
+    Staged {
+        /// `true` when `git.has_staged_changes()` returned true after the
+        /// final stage call — i.e. the dispatch (and any auditor edits)
+        /// produced code outside `exclude_paths`. `false` when the only
+        /// changes were inside `.pitboss/` and got excluded.
+        has_changes: bool,
+    },
 }
 
 async fn forward_agent_events(mut rx: mpsc::Receiver<AgentEvent>, tx: broadcast::Sender<Event>) {
