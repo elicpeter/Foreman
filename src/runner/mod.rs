@@ -529,6 +529,13 @@ impl<A: Agent, G: Git> Runner<A, G> {
     /// itself does not close because `Runner` keeps owning the sender for
     /// post-run lookups (e.g., PR creation reads `runner.state()`).
     pub async fn run(&mut self) -> Result<RunSummary> {
+        // Resume guard: a previous run drove past the final phase and either
+        // halted inside the final-sweep loop or interrupted before the loop
+        // could clear `pending_sweep`. Re-enter the loop directly so we don't
+        // accidentally re-run the final phase below.
+        if self.is_post_final_phase_state() {
+            return self.finish_or_run_final_sweep_loop().await;
+        }
         loop {
             let result = self.run_phase().await?;
             match result {
@@ -542,12 +549,151 @@ impl<A: Agent, G: Git> Runner<A, G> {
                 PhaseResult::Advanced {
                     next_phase: None, ..
                 } => {
-                    let _ = self.events_tx.send(Event::RunFinished);
-                    return Ok(RunSummary::Finished);
+                    return self.finish_or_run_final_sweep_loop().await;
                 }
                 PhaseResult::Advanced { .. } => {}
             }
         }
+    }
+
+    /// True when state + plan describe "the final regular phase has committed
+    /// but `Runner::run` hasn't yet emitted [`Event::RunFinished`]". The plan
+    /// never advances `current_phase` past the last phase, so after a final
+    /// commit `state.completed.last() == plan.current_phase`. A halted phase
+    /// or sweep before the final commit lands does not satisfy this — its
+    /// `state.completed.last()` is the *previous* phase id.
+    fn is_post_final_phase_state(&self) -> bool {
+        let Some(last_completed) = self.state.completed.last() else {
+            return false;
+        };
+        last_completed == &self.plan.current_phase
+            && self.next_phase_id_after(last_completed).is_none()
+    }
+
+    /// Shared tail used by both the success path of [`Runner::run`]'s phase
+    /// loop and the post-final-phase resume guard. Either dispatches the
+    /// bounded final-sweep drain loop (when sweeps are enabled, the trailing
+    /// drain is enabled, the operator did not pass `--no-sweep`, and at least
+    /// one unchecked item remains) or emits [`Event::RunFinished`] and
+    /// returns.
+    async fn finish_or_run_final_sweep_loop(&mut self) -> Result<RunSummary> {
+        let after = self
+            .state
+            .completed
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.plan.current_phase.clone());
+        if self.should_run_final_sweep_loop() {
+            return self.run_final_sweep_loop(after).await;
+        }
+        // No drain loop: clear any inherited `pending_sweep` (a `--no-sweep`
+        // resume of a halted final-sweep run gets here) before declaring the
+        // run finished, so a follow-up `pitboss play` doesn't see stale state.
+        if self.state.pending_sweep {
+            self.state.pending_sweep = false;
+            state::save(&self.workspace, Some(&self.state))
+                .context("runner: clearing pending_sweep at run finish")?;
+        }
+        let _ = self.events_tx.send(Event::RunFinished);
+        Ok(RunSummary::Finished)
+    }
+
+    /// Decide whether the final-sweep drain loop should run. The master
+    /// `[sweep] enabled` switch dominates the trailing-drain
+    /// `[sweep] final_sweep_enabled` toggle so an operator with sweeps
+    /// disabled never sees a surprise drain pass. `--no-sweep` suppresses the
+    /// loop the same way it suppresses between-phase sweeps.
+    fn should_run_final_sweep_loop(&self) -> bool {
+        if matches!(self.sweep_override, SweepOverride::Skip) {
+            return false;
+        }
+        if !self.config.sweep.enabled {
+            return false;
+        }
+        if !self.config.sweep.final_sweep_enabled {
+            return false;
+        }
+        sweep::unchecked_count(&self.deferred) > 0
+    }
+
+    /// Bounded final-sweep drain. Runs after the final regular phase commits
+    /// (or when a previous run halted inside this loop) and dispatches at most
+    /// [`crate::config::SweepConfig::final_sweep_max_iterations`] sweeps in a
+    /// row. Each iteration must resolve at least one item or the loop exits;
+    /// items the agent genuinely can't fix fall through to phase 05's
+    /// staleness machinery.
+    ///
+    /// `after` is the phase id every dispatch anchors on — the last completed
+    /// regular phase. Each iteration calls [`Runner::run_sweep_step_inner`] so
+    /// the existing sweep/auditor/staleness pipeline runs unchanged; the loop
+    /// adds only the iteration cap, the no-progress exit, and the per-iter
+    /// `pre_unchecked == 0` short-circuit.
+    async fn run_final_sweep_loop(&mut self, after: PhaseId) -> Result<RunSummary> {
+        // The post-final-phase commit reset `consecutive_sweeps` to 0 already,
+        // but a halted-then-resumed loop might inherit a stale value. We
+        // bypass the gate in [`Runner::run_phase_inner`] and dispatch
+        // [`Runner::run_sweep_step_inner`] directly, so the clamp can't pre-empt
+        // the loop — but resetting keeps the persisted counter honest for
+        // observers (`pitboss status`, the TUI).
+        self.state.consecutive_sweeps = 0;
+
+        let max_iters = self.config.sweep.final_sweep_max_iterations.max(1);
+        for _iter in 1..=max_iters {
+            let pre_unchecked = sweep::unchecked_count(&self.deferred);
+            if pre_unchecked == 0 {
+                // Drain succeeded (either the previous iteration cleared the
+                // last item, or we entered with an already-empty backlog).
+                break;
+            }
+            self.state.pending_sweep = true;
+            state::save(&self.workspace, Some(&self.state))
+                .context("runner: persisting pending_sweep for final-sweep iter")?;
+            let after_clone = after.clone();
+            let result = self
+                .run_sweep_step_inner(after_clone.clone(), Some(after_clone), None)
+                .await?;
+            match result {
+                PhaseResult::Halted { reason, .. } => {
+                    // `pending_sweep` stays true on the halt path so a resume
+                    // re-enters this loop from iteration 1. Persist here
+                    // because `run_sweep_step_inner`'s halt path doesn't save
+                    // (the regular gate relies on `run_phase`'s save wrapper,
+                    // which doesn't run on this code path), and phase 05's
+                    // staleness counter increments must survive the halt so
+                    // cumulative progress carries across resumes.
+                    state::save(&self.workspace, Some(&self.state))
+                        .context("runner: persisting state at final-sweep halt")?;
+                    let _ = self.events_tx.send(Event::PhaseHalted {
+                        phase_id: after.clone(),
+                        reason: reason.clone(),
+                    });
+                    return Ok(RunSummary::Halted {
+                        phase_id: after,
+                        reason,
+                    });
+                }
+                PhaseResult::Advanced { .. } => {
+                    let post_unchecked = sweep::unchecked_count(&self.deferred);
+                    let resolved = pre_unchecked.saturating_sub(post_unchecked);
+                    if resolved == 0 {
+                        // Stuck items survive the loop and surface via phase
+                        // 05's staleness machinery.
+                        break;
+                    }
+                }
+            }
+        }
+        // Clean exit — `run_sweep_step_inner` already cleared `pending_sweep`
+        // on each successful iteration, but a `pre_unchecked == 0` short
+        // circuit at the top of iteration 1 (resume on a backlog the user
+        // drained by hand) needs us to clear it here too.
+        if self.state.pending_sweep {
+            self.state.pending_sweep = false;
+            state::save(&self.workspace, Some(&self.state))
+                .context("runner: clearing pending_sweep after final-sweep loop")?;
+        }
+        let _ = self.events_tx.send(Event::RunFinished);
+        Ok(RunSummary::Finished)
     }
 
     /// Execute the current phase to completion (success or halt).

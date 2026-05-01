@@ -431,6 +431,18 @@ pub struct SweepConfig {
     /// Whether the auditor pass runs after a sweep dispatch the way it does
     /// after a regular phase. Consumed by phase 04.
     pub audit_enabled: bool,
+    /// Whether the runner runs a bounded final-sweep drain loop after the
+    /// final regular phase commits. Independent of [`Self::enabled`] so an
+    /// operator can disable between-phase sweeps while keeping the trailing
+    /// drain on, or vice versa. Consumed by phase 08. To disable the loop
+    /// entirely set this to `false` rather than reducing
+    /// [`Self::final_sweep_max_iterations`] to zero.
+    pub final_sweep_enabled: bool,
+    /// Maximum number of iterations the final-sweep drain loop may run
+    /// before exiting. The loop also exits early when the unchecked-item
+    /// count reaches zero or when an iteration resolves no items
+    /// (no-progress guard). Consumed by phase 08; validation rejects zero.
+    pub final_sweep_max_iterations: u32,
 }
 
 impl Default for SweepConfig {
@@ -442,6 +454,8 @@ impl Default for SweepConfig {
             max_consecutive: 1,
             escalate_after: 3,
             audit_enabled: true,
+            final_sweep_enabled: true,
+            final_sweep_max_iterations: 3,
         }
     }
 }
@@ -550,6 +564,9 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.sweep.escalate_after < 1 {
         anyhow::bail!("config.toml: [sweep] escalate_after must be >= 1");
     }
+    if cfg.sweep.final_sweep_max_iterations < 1 {
+        anyhow::bail!("config.toml: [sweep] final_sweep_max_iterations must be >= 1");
+    }
     Ok(())
 }
 
@@ -602,6 +619,8 @@ fn find_unknown_keys(value: &toml::Value) -> Vec<String> {
                 "max_consecutive",
                 "escalate_after",
                 "audit_enabled",
+                "final_sweep_enabled",
+                "final_sweep_max_iterations",
             ],
             _ => {
                 out.push(section.clone());
@@ -672,6 +691,9 @@ mod tests {
         assert_eq!(cfg.sweep.max_consecutive, 1);
         assert_eq!(cfg.sweep.escalate_after, 3);
         assert!(cfg.sweep.audit_enabled);
+        // Phase 08 final-sweep drain defaults: enabled with a 3-iteration cap.
+        assert!(cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 3);
     }
 
     #[test]
@@ -1220,6 +1242,8 @@ trigger_max_items = 10
 max_consecutive = 2
 escalate_after = 4
 audit_enabled = false
+final_sweep_enabled = false
+final_sweep_max_iterations = 5
 ";
         let cfg = parse(text).unwrap();
         assert!(!cfg.sweep.enabled);
@@ -1228,9 +1252,34 @@ audit_enabled = false
         assert_eq!(cfg.sweep.max_consecutive, 2);
         assert_eq!(cfg.sweep.escalate_after, 4);
         assert!(!cfg.sweep.audit_enabled);
+        assert!(!cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 5);
 
         let value: toml::Value = toml::from_str(text).unwrap();
         assert!(find_unknown_keys(&value).is_empty());
+    }
+
+    #[test]
+    fn pre_phase_08_section_picks_up_final_sweep_defaults() {
+        // A `pitboss.toml` written before phase 08 has no `final_sweep_*`
+        // keys; the fields must round-trip to their defaults.
+        let text = "
+[sweep]
+enabled = true
+trigger_min_items = 4
+escalate_after = 2
+";
+        let cfg = parse(text).unwrap();
+        assert!(cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 3);
+    }
+
+    #[test]
+    fn final_sweep_max_iterations_zero_is_rejected() {
+        let text = "[sweep]\nfinal_sweep_max_iterations = 0\n";
+        let err = parse(text).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("final_sweep_max_iterations"), "msg: {msg}");
     }
 
     #[test]
@@ -1249,6 +1298,8 @@ trigger_min_items = 7
         assert_eq!(cfg.sweep.max_consecutive, 1);
         assert_eq!(cfg.sweep.escalate_after, 3);
         assert!(cfg.sweep.audit_enabled);
+        assert!(cfg.sweep.final_sweep_enabled);
+        assert_eq!(cfg.sweep.final_sweep_max_iterations, 3);
     }
 
     #[test]

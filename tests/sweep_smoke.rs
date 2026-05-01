@@ -206,6 +206,11 @@ fn audit_disabled() -> Config {
     // implementer-only sweep flow. The audit-on path for sweeps is covered
     // explicitly in `tests/sweep_auditor.rs`.
     c.sweep.audit_enabled = false;
+    // Phase 08's trailing drain loop fires after the final phase if any
+    // unchecked item remains. These tests assert exact sweep counts in the
+    // between-phase position, so they opt out of the drain. The drain is
+    // covered explicitly in `tests/sweep_final_loop.rs`.
+    c.sweep.final_sweep_enabled = false;
     c
 }
 

@@ -194,7 +194,12 @@ fn git_show_files(dir: &Path, commit: &str) -> Vec<String> {
 /// Config with both `[audit] enabled` and `[sweep] audit_enabled` on (the
 /// default), with the trigger set so 5 unchecked items trip a sweep.
 fn audit_full_enabled() -> Config {
-    Config::default()
+    let mut c = Config::default();
+    // Phase 08's trailing drain loop is covered in `sweep_final_loop.rs`;
+    // these tests assert the audit-on between-phase flow with exact sweep
+    // counts, so opt out of the drain.
+    c.sweep.final_sweep_enabled = false;
+    c
 }
 
 async fn build_runner(

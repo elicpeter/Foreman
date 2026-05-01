@@ -192,6 +192,10 @@ fn staleness_config() -> Config {
     c.audit.enabled = false;
     c.sweep.audit_enabled = false;
     c.sweep.trigger_min_items = 1;
+    // Phase 08's trailing drain loop fires after the final phase if any
+    // unchecked item remains. These tests count sweeps that fire between
+    // phases; the drain is covered in `tests/sweep_final_loop.rs`.
+    c.sweep.final_sweep_enabled = false;
     // Default escalate_after = 3 stays — the tests reason about that value.
     c
 }

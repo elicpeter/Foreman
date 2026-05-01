@@ -204,6 +204,11 @@ fn git_log_oneline(dir: &Path) -> Vec<String> {
 fn audit_disabled() -> Config {
     let mut c = Config::default();
     c.audit.enabled = false;
+    // Phase 08's trailing drain loop fires after the final phase whenever a
+    // backlog of unchecked items remains. The phase 12/13/14 tests in this
+    // file predate the drain and assert exact commit/event counts, so opt
+    // out. Drain coverage lives in `tests/sweep_final_loop.rs`.
+    c.sweep.final_sweep_enabled = false;
     c
 }
 
@@ -842,11 +847,16 @@ async fn auditor_skipped_when_implementer_only_touched_planning_artifacts() {
         Script::default().write(".pitboss/play/deferred.md", new_deferred.as_bytes())
     ]);
 
+    // Phase 08's trailing drain would fire after this single-phase plan and
+    // bump the attempts counter; this test asserts the implementer-only path.
+    let mut cfg = Config::default();
+    cfg.sweep.final_sweep_enabled = false;
+
     let (mut runner, _g) = build_runner(
         dir.path(),
         ONE_PHASE_PLAN,
         EMPTY_DEFERRED,
-        Config::default(),
+        cfg,
         agent,
     )
     .await;
