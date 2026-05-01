@@ -456,9 +456,7 @@ impl App {
                 // accurate "between dispatches" state.
                 self.activity = Activity::Idle;
                 let line = match commit {
-                    Some(c) => format!(
-                        "[sweep] after {after}: {resolved} items resolved ({c})"
-                    ),
+                    Some(c) => format!("[sweep] after {after}: {resolved} items resolved ({c})"),
                     None => format!("[sweep] after {after}: {resolved} items resolved"),
                 };
                 self.push_output(line);
@@ -625,8 +623,7 @@ impl App {
         // stats. The phase list always renders so the operator can see where
         // they are in the run even on a tiny terminal.
         let height = cols[0].height;
-        let want_stale = !self.stale_items.is_empty()
-            && height >= STATS_HEIGHT + STALE_HEIGHT + 4;
+        let want_stale = !self.stale_items.is_empty() && height >= STATS_HEIGHT + STALE_HEIGHT + 4;
         let want_stats = height >= STATS_HEIGHT + 4;
         if want_stale {
             let left = Layout::default()
@@ -813,10 +810,7 @@ impl App {
         }
         if total > take {
             let extra = total - take;
-            lines.push(Line::from(Span::styled(
-                format!(" +{extra} more"),
-                dim,
-            )));
+            lines.push(Line::from(Span::styled(format!(" +{extra} more"), dim)));
         }
 
         let mut title = format!(" stale items ({total}) ");
@@ -2068,5 +2062,4 @@ mod tests {
         let snap = render_to_string(&app, 120, 30);
         insta::assert_snapshot!("stale_items_panel", snap);
     }
-
 }

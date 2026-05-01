@@ -850,14 +850,8 @@ async fn auditor_skipped_when_implementer_only_touched_planning_artifacts() {
     let mut cfg = Config::default();
     common::disable_final_sweep(&mut cfg);
 
-    let (mut runner, _g) = build_runner(
-        dir.path(),
-        ONE_PHASE_PLAN,
-        EMPTY_DEFERRED,
-        cfg,
-        agent,
-    )
-    .await;
+    let (mut runner, _g) =
+        build_runner(dir.path(), ONE_PHASE_PLAN, EMPTY_DEFERRED, cfg, agent).await;
 
     let mut rx = runner.subscribe();
     let collector = tokio::spawn(async move {

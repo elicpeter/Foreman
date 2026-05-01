@@ -73,7 +73,12 @@ fn pending_items(n: usize) -> DeferredDoc {
     }
 }
 
-fn render(workspace: &Path, plan: &Plan, deferred: &DeferredDoc, state: Option<&RunState>) -> String {
+fn render(
+    workspace: &Path,
+    plan: &Plan,
+    deferred: &DeferredDoc,
+    state: Option<&RunState>,
+) -> String {
     let cfg = Config::default();
     render_report(workspace, plan, deferred, state, &cfg, false)
 }
@@ -163,12 +168,8 @@ fn sweep_block_renders_stale_items_capped_and_sorted() {
     let p_audit = report
         .find("\"audit defaults\"")
         .expect("audit defaults entry; report:\n{report}");
-    let p_polish = report
-        .find("\"polish error\"")
-        .expect("polish error entry");
-    let p_rename = report
-        .find("\"rename flag\"")
-        .expect("rename flag entry");
+    let p_polish = report.find("\"polish error\"").expect("polish error entry");
+    let p_rename = report.find("\"rename flag\"").expect("rename flag entry");
     assert!(
         p_audit < p_polish && p_polish < p_rename,
         "expected sorted by descending attempts; got positions audit={p_audit} polish={p_polish} rename={p_rename}; report:\n{report}"

@@ -213,9 +213,7 @@ async fn build_runner(
 
 /// Stamp tag for events: the same compact `Started/Completed/Halted/RunFinished`
 /// format used in `sweep_smoke.rs`, plus `PhaseHalted` for halt-path tests.
-async fn collect_events(
-    mut rx: tokio::sync::broadcast::Receiver<Event>,
-) -> Vec<String> {
+async fn collect_events(mut rx: tokio::sync::broadcast::Receiver<Event>) -> Vec<String> {
     use tokio::sync::broadcast::error::RecvError;
     let mut events = Vec::new();
     loop {
@@ -234,9 +232,7 @@ async fn collect_events(
             Ok(Event::SweepCompleted {
                 after, resolved, ..
             }) => events.push(format!("SweepCompleted({after},{resolved})")),
-            Ok(Event::SweepHalted { after, .. }) => {
-                events.push(format!("SweepHalted({after})"))
-            }
+            Ok(Event::SweepHalted { after, .. }) => events.push(format!("SweepHalted({after})")),
             Ok(Event::PhaseHalted { phase_id, .. }) => {
                 events.push(format!("PhaseHalted({phase_id})"));
                 break;
@@ -422,7 +418,11 @@ async fn multi_iteration_progress() {
         .iter()
         .filter(|e| e.starts_with("SweepStarted("))
         .collect();
-    assert_eq!(starts.len(), 3, "expected 3 sweep iters; events: {events:?}");
+    assert_eq!(
+        starts.len(),
+        3,
+        "expected 3 sweep iters; events: {events:?}"
+    );
     assert_eq!(starts[0], "SweepStarted(01,9)");
     assert_eq!(starts[1], "SweepStarted(01,5)");
     assert_eq!(starts[2], "SweepStarted(01,2)");
@@ -624,12 +624,7 @@ async fn halt_mid_loop_then_resume_drains() {
     let plan_obj = plan::parse(ONE_PHASE_PLAN).expect("parse plan");
     let deferred_text = fs::read_to_string(dir.path().join(".pitboss/play/deferred.md")).unwrap();
     let deferred = pitboss::deferred::parse(&deferred_text).unwrap();
-    let drained = deferred_items_only(&[
-        ("c", true),
-        ("d", true),
-        ("e", true),
-        ("f", true),
-    ]);
+    let drained = deferred_items_only(&[("c", true), ("d", true), ("e", true), ("f", true)]);
     let agent = ScriptedAgent::new(vec![Script::default()
         .write(".pitboss/play/deferred.md", drained.as_bytes())
         .write("src/sweep_resume.rs", b"// resume\n")]);
@@ -673,9 +668,7 @@ async fn disabled_config_skips_loop() {
     let dir = make_workspace(ONE_PHASE_PLAN, &initial);
     init_git_repo(dir.path());
 
-    let agent = ScriptedAgent::new(vec![
-        Script::default().write("src/phase_01.rs", b"// 1\n"),
-    ]);
+    let agent = ScriptedAgent::new(vec![Script::default().write("src/phase_01.rs", b"// 1\n")]);
     let mut config = final_loop_config();
     config.sweep.final_sweep_enabled = false;
     let mut runner = build_runner(dir.path(), ONE_PHASE_PLAN, &initial, config, agent).await;
@@ -701,9 +694,7 @@ async fn master_switch_off_dominates_final_sweep() {
     let dir = make_workspace(ONE_PHASE_PLAN, &initial);
     init_git_repo(dir.path());
 
-    let agent = ScriptedAgent::new(vec![
-        Script::default().write("src/phase_01.rs", b"// 1\n"),
-    ]);
+    let agent = ScriptedAgent::new(vec![Script::default().write("src/phase_01.rs", b"// 1\n")]);
     let mut config = final_loop_config();
     config.sweep.enabled = false;
     assert!(config.sweep.final_sweep_enabled, "default stays on");
@@ -731,9 +722,7 @@ async fn already_empty_skips_loop() {
     let dir = make_workspace(ONE_PHASE_PLAN, &initial);
     init_git_repo(dir.path());
 
-    let agent = ScriptedAgent::new(vec![
-        Script::default().write("src/phase_01.rs", b"// 1\n"),
-    ]);
+    let agent = ScriptedAgent::new(vec![Script::default().write("src/phase_01.rs", b"// 1\n")]);
     let mut runner = build_runner(
         dir.path(),
         ONE_PHASE_PLAN,
@@ -790,7 +779,10 @@ async fn no_progress_increments_staleness_then_exits() {
         .iter()
         .filter(|e| e.starts_with("SweepStarted("))
         .count();
-    assert_eq!(starts, 1, "no-progress exit fires after one iter; events: {events:?}");
+    assert_eq!(
+        starts, 1,
+        "no-progress exit fires after one iter; events: {events:?}"
+    );
 
     let state = pitboss::state::load(dir.path()).unwrap().expect("state");
     assert_eq!(state.deferred_item_attempts.get("alpha").copied(), Some(1));
@@ -813,9 +805,7 @@ async fn no_sweep_override_suppresses_final_loop() {
     let dir = make_workspace(ONE_PHASE_PLAN, &initial);
     init_git_repo(dir.path());
 
-    let agent = ScriptedAgent::new(vec![
-        Script::default().write("src/phase_01.rs", b"// 1\n"),
-    ]);
+    let agent = ScriptedAgent::new(vec![Script::default().write("src/phase_01.rs", b"// 1\n")]);
     let mut runner = build_runner(
         dir.path(),
         ONE_PHASE_PLAN,
@@ -885,9 +875,7 @@ async fn halted_final_phase_skips_final_loop() {
         !events.iter().any(|e| e.starts_with("SweepStarted(")),
         "final-sweep loop must not fire when the final phase halts; events: {events:?}"
     );
-    assert!(events
-        .iter()
-        .any(|e| e == "PhaseHalted(01)"));
+    assert!(events.iter().any(|e| e == "PhaseHalted(01)"));
 }
 
 /// Hardening regression: the final-phase resume guard must fire on the

@@ -794,13 +794,10 @@ impl<A: Agent, G: Git> Runner<A, G> {
                 // operators don't expect "between phases" wording before the
                 // first phase has even started. Clear the obligation, log the
                 // skip for visibility, and fall through to phase 01.
-                tracing::info!(
-                    "skipping forced sweep: no completed phases yet to anchor on"
-                );
+                tracing::info!("skipping forced sweep: no completed phases yet to anchor on");
                 self.state.pending_sweep = false;
-                state::save(&self.workspace, Some(&self.state)).context(
-                    "runner: persisting state.json after fresh-run force-sweep no-op",
-                )?;
+                state::save(&self.workspace, Some(&self.state))
+                    .context("runner: persisting state.json after fresh-run force-sweep no-op")?;
                 self.deferred = parsed;
             } else {
                 self.state.pending_sweep = false;

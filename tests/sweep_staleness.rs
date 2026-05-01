@@ -310,14 +310,7 @@ async fn counter_resets_when_item_resolved() {
     // here — assert on state right after the 2nd sweep instead.
     config.sweep.escalate_after = 5; // keep no events from firing in this test
 
-    let mut runner = build_runner(
-        dir.path(),
-        FOUR_PHASE_PLAN,
-        &initial,
-        config,
-        agent,
-    )
-    .await;
+    let mut runner = build_runner(dir.path(), FOUR_PHASE_PLAN, &initial, config, agent).await;
 
     // Drive phase 01 → sweep 1 → phase 02 → sweep 2 → phase 03 by hand so we
     // can stop before the script queue runs out.
@@ -375,7 +368,10 @@ async fn halted_sweep_increments_counter_for_survivors() {
     let _ = runner.run_phase().await.unwrap();
 
     let state = pitboss::state::load(dir.path()).unwrap().expect("state");
-    assert!(state.pending_sweep, "pending_sweep persists after sweep halt");
+    assert!(
+        state.pending_sweep,
+        "pending_sweep persists after sweep halt"
+    );
     assert_eq!(
         state.deferred_item_attempts.get("alpha").copied(),
         Some(1),
@@ -415,10 +411,7 @@ async fn pre_dispatch_budget_halt_does_not_tick_staleness() {
     // bumping attempts or sending `SweepStarted`.
     runner.state_mut().token_usage.input = 200;
 
-    let result = runner
-        .run_standalone_sweep(None, None, true)
-        .await
-        .unwrap();
+    let result = runner.run_standalone_sweep(None, None, true).await.unwrap();
     assert!(
         matches!(result, pitboss::runner::PhaseResult::Halted { .. }),
         "expected halt, got {result:?}",
@@ -512,12 +505,12 @@ async fn escalation_event_does_not_refire_on_subsequent_increment() {
     // 04. We do that mid-run by pausing after the 3rd sweep.
     let agent = ScriptedAgent::new(vec![
         Script::default().write("src/p1.rs", b"// 1\n"), // 1
-        Script::default(),                                // sweep 1 (2)
+        Script::default(),                               // sweep 1 (2)
         Script::default().write("src/p2.rs", b"// 2\n"), // 3
-        Script::default(),                                // sweep 2 (4)
+        Script::default(),                               // sweep 2 (4)
         Script::default().write("src/p3.rs", b"// 3\n"), // 5
-        Script::default(),                                // sweep 3 (6) — events fire here
-        Script::default(),                                // sweep 4 (7) — must NOT re-emit
+        Script::default(),                               // sweep 3 (6) — events fire here
+        Script::default(),                               // sweep 4 (7) — must NOT re-emit
         Script::default().write("src/p4.rs", b"// 4\n"), // 8
     ]);
 
@@ -791,9 +784,7 @@ fn stale_items_empty_when_below_threshold() {
     let cfg = staleness_config();
     let mut state = runner::fresh_run_state(&plan_obj, &cfg, Utc::now());
     // Two items at attempts=2, below the default escalate_after=3.
-    state
-        .deferred_item_attempts
-        .insert("alpha".to_string(), 2);
+    state.deferred_item_attempts.insert("alpha".to_string(), 2);
     state.deferred_item_attempts.insert("beta".to_string(), 1);
 
     let runner = Runner::new(

@@ -251,7 +251,12 @@ async fn no_sweep_override_suppresses_threshold_sweep() {
     use tokio::sync::broadcast::error::RecvError;
 
     let pairs: Vec<(&str, bool)> = (0..10)
-        .map(|i| (Box::leak(format!("item {i}").into_boxed_str()) as &str, false))
+        .map(|i| {
+            (
+                Box::leak(format!("item {i}").into_boxed_str()) as &str,
+                false,
+            )
+        })
         .collect();
     let initial = deferred_items_only(&pairs);
     let dir = make_workspace(TWO_PHASE_PLAN, &initial);
@@ -357,9 +362,9 @@ async fn sweep_override_forces_sweep_below_threshold() {
                 Ok(Event::SweepStarted { after, .. }) => {
                     events.push(format!("SweepStarted({after})"))
                 }
-                Ok(Event::SweepCompleted { after, resolved, .. }) => {
-                    events.push(format!("SweepCompleted({after},{resolved})"))
-                }
+                Ok(Event::SweepCompleted {
+                    after, resolved, ..
+                }) => events.push(format!("SweepCompleted({after},{resolved})")),
                 Ok(Event::PhaseStarted { phase_id, .. }) => {
                     events.push(format!("PhaseStarted({phase_id})"))
                 }
@@ -448,9 +453,7 @@ async fn sweep_override_on_fresh_run_skips_pre_phase_sweep() {
         .iter()
         .position(|e| e == "PhaseStarted(01)")
         .expect("phase 01 must start");
-    let pre_phase_sweep = events[..phase_pos]
-        .iter()
-        .any(|e| e == "SweepStarted");
+    let pre_phase_sweep = events[..phase_pos].iter().any(|e| e == "SweepStarted");
     assert!(
         !pre_phase_sweep,
         "fresh-run --sweep must not dispatch a sweep before phase 01; events: {events:?}",
@@ -574,18 +577,9 @@ async fn standalone_sweep_runs_without_advancing_plan() {
     )
     .await;
 
-    let result = runner
-        .run_standalone_sweep(None, None, true)
-        .await
-        .unwrap();
+    let result = runner.run_standalone_sweep(None, None, true).await.unwrap();
     assert!(
-        matches!(
-            result,
-            PhaseResult::Advanced {
-                commit: None,
-                ..
-            }
-        ),
+        matches!(result, PhaseResult::Advanced { commit: None, .. }),
         "standalone sweep without edits must produce no commit; got {result:?}"
     );
 
@@ -623,7 +617,7 @@ async fn standalone_sweep_max_items_clamps_prompt() {
 
     let captured_prompt = dir.path().join("captured-prompt.txt");
     let agent = ScriptedAgent::new(vec![
-        Script::default().capture_prompt_to(captured_prompt.clone()),
+        Script::default().capture_prompt_to(captured_prompt.clone())
     ]);
 
     let mut runner = build_runner(
@@ -710,10 +704,7 @@ async fn standalone_sweep_halt_persists_pending_sweep() {
     // path only proves the flag isn't *set* — not that it isn't *cleared*.
     runner.state_mut().pending_sweep = true;
 
-    let result = runner
-        .run_standalone_sweep(None, None, true)
-        .await
-        .unwrap();
+    let result = runner.run_standalone_sweep(None, None, true).await.unwrap();
     assert!(matches!(result, PhaseResult::Halted { .. }));
 
     let state_after = runner.state().clone();

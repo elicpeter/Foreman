@@ -33,10 +33,10 @@ use clap::Parser;
 
 use crate::agent::dry_run::{DryRunAgent, DryRunFinal};
 use crate::agent::{self, Agent, AgentEvent};
+use crate::cli::ExitCode;
 use crate::config;
 use crate::deferred::{self, DeferredDoc};
 use crate::git::{Git, ShellGit};
-use crate::cli::ExitCode;
 use crate::plan::{self, PhaseId, Plan};
 use crate::runner::{self, PhaseResult, Runner};
 use crate::state::{self, TokenUsage};

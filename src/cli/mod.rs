@@ -203,15 +203,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode> {
             no_sweep,
             sweep,
         } => {
-            play::run(
-                std::env::current_dir()?,
-                tui,
-                pr,
-                dry_run,
-                no_sweep,
-                sweep,
-            )
-            .await?;
+            play::run(std::env::current_dir()?, tui, pr, dry_run, no_sweep, sweep).await?;
             Ok(ExitCode::Success)
         }
         Command::Status => {
@@ -225,15 +217,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode> {
             no_sweep,
             sweep,
         } => {
-            rebuy::run(
-                std::env::current_dir()?,
-                tui,
-                pr,
-                dry_run,
-                no_sweep,
-                sweep,
-            )
-            .await?;
+            rebuy::run(std::env::current_dir()?, tui, pr, dry_run, no_sweep, sweep).await?;
             Ok(ExitCode::Success)
         }
         Command::Sweep(args) => sweep::run(std::env::current_dir()?, args).await,
