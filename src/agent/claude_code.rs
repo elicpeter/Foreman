@@ -7,9 +7,10 @@
 //! Pitboss shells out to whatever `claude` binary is on `PATH` (or the path
 //! you pass to [`ClaudeCodeAgent::with_binary`]). Install per Anthropic's
 //! Claude Code docs and authenticate (`claude auth login`) before running
-//! pitboss. To verify the install, run `claude -p "hello" --output-format
-//! stream-json --verbose --model haiku` from a shell — pitboss invokes the
-//! binary with the same flag set.
+//! pitboss. To verify the install, run `echo "hello" | claude -p
+//! --output-format stream-json --verbose --model haiku` from a shell —
+//! pitboss invokes the binary with the same flag set and pipes the user
+//! prompt on stdin (avoids OS ARG_MAX overflow on large sweep payloads).
 //!
 //! Pitboss picks the `--permission-mode` flag per dispatch based on the model:
 //! Opus gets `auto` (Anthropic's Auto Mode is Opus-only; Sonnet/Haiku see the
@@ -104,9 +105,11 @@ impl ClaudeCodeAgent {
         self
     }
 
-    /// Append extra argv that gets spliced in just before the positional `--`
-    /// prompt sigil on every invocation. Mirrors `[agent.claude_code]
-    /// extra_args` in `config.toml`.
+    /// Append extra argv that gets spliced in on every invocation, just before
+    /// the trailing flags but after the standard ones. Mirrors
+    /// `[agent.claude_code] extra_args` in `config.toml`. The user prompt is
+    /// delivered on stdin, not argv, so extra_args may not include a positional
+    /// prompt argument.
     pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
         self.extra_args = args;
         self
@@ -146,6 +149,7 @@ impl Agent for ClaudeCodeAgent {
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
         let log_path = req.log_path.clone();
+        let stdin_payload = req.user_prompt.as_bytes().to_vec();
         let cmd = self.build_command(&req);
 
         // Raw subprocess events flow through `raw_*` then a forwarder turns
@@ -179,8 +183,15 @@ impl Agent for ClaudeCodeAgent {
             }
         });
 
-        let sub_outcome: SubprocessOutcome =
-            subprocess::run_logged(cmd, &log_path, raw_tx, cancel, req.timeout).await?;
+        let sub_outcome: SubprocessOutcome = subprocess::run_logged_with_stdin(
+            cmd,
+            &log_path,
+            raw_tx,
+            cancel,
+            req.timeout,
+            Some(stdin_payload),
+        )
+        .await?;
         let ForwarderResult {
             mut tokens,
             error_message,
@@ -274,9 +285,10 @@ impl ClaudeCodeAgent {
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
-        // Positional prompt argument comes last so flag parsing doesn't get
-        // confused if the prompt happens to start with `--`.
-        cmd.arg("--").arg(&req.user_prompt);
+        // Prompt is delivered on stdin (no positional argv) so large payloads
+        // (sweep snapshots, diffs, file contents) don't trip the OS ARG_MAX
+        // limit and fail spawn with E2BIG. With `--print` and no positional
+        // prompt, claude reads the prompt body from stdin.
         cmd
     }
 }
@@ -637,8 +649,16 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w[0] == "--append-system-prompt" && w[1] == "system body"));
-        // Positional prompt fenced behind `--` so it can't be misread.
-        assert!(args.windows(2).any(|w| w[0] == "--" && w[1] == "user body"));
+        // User prompt is delivered on stdin (not argv) to avoid OS ARG_MAX
+        // overflow on large sweep payloads. Argv must not carry the prompt.
+        assert!(
+            !args.iter().any(|a| a == "user body"),
+            "user prompt must not appear on argv: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--"),
+            "obsolete `--` sigil must not appear on argv: {args:?}"
+        );
         assert_eq!(std_cmd.get_program(), "/usr/local/bin/claude");
         assert_eq!(std_cmd.get_current_dir(), Some(dir.path()));
     }
@@ -646,9 +666,9 @@ mod tests {
     #[tokio::test]
     async fn build_command_applies_model_override_and_extra_args() {
         // A `[agent.claude_code] model = "..."` override beats the per-role
-        // model in `req.model`, and `extra_args` get spliced in before the
-        // positional `--` prompt sigil. Both have to actually reach the spawned
-        // command, otherwise pitboss silently drops user config.
+        // model in `req.model`, and `extra_args` get spliced into the argv.
+        // Both have to actually reach the spawned command, otherwise pitboss
+        // silently drops user config.
         let agent = ClaudeCodeAgent::with_binary("claude")
             .with_extra_args(vec!["--max-turns".into(), "50".into()])
             .with_model_override("claude-opus-4-7");
@@ -684,11 +704,9 @@ mod tests {
                 .any(|w| w[0] == "--max-turns" && w[1] == "50"),
             "extra_args missing: {args:?}"
         );
-        let max_turns_idx = args.iter().position(|a| a == "--max-turns").unwrap();
-        let dashdash_idx = args.iter().position(|a| a == "--").unwrap();
         assert!(
-            max_turns_idx < dashdash_idx,
-            "extra_args must appear before the positional `--` sigil: {args:?}"
+            !args.iter().any(|a| a == "u"),
+            "user prompt must not appear on argv (delivered via stdin): {args:?}"
         );
     }
 

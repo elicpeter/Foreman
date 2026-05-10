@@ -11,10 +11,11 @@
 //! reading `hello` from stdin works from a shell — pitboss invokes the binary
 //! with the same flag shape.
 //!
-//! Pitboss runs the agent under `--ask-for-approval never` and
+//! Pitboss runs the agent under `--ask-for-approval never` by default and
 //! `--skip-git-repo-check` so it never blocks on an interactive prompt and so
-//! it works inside scratch worktrees that aren't full git repos. Override via
-//! `[agent.codex] extra_args = […]` if you need different policy flags.
+//! it works inside scratch worktrees that aren't full git repos. Set
+//! `[agent.codex] approval_policy = "on-request"` if you want Codex to decide
+//! when a command should be escalated for human approval.
 //!
 //! ## Prompt assembly
 //!
@@ -67,6 +68,8 @@ use super::{
 
 /// Default binary name. Resolved against `PATH` by the OS.
 const DEFAULT_BINARY: &str = "codex";
+/// Default approval policy for non-interactive runs.
+const DEFAULT_APPROVAL_POLICY: &str = "never";
 
 /// How many trailing stderr lines to attach to a [`StopReason::Error`] when
 /// the process exits non-zero. Bounded so a chatty error doesn't flood the
@@ -79,6 +82,7 @@ pub struct CodexAgent {
     binary: PathBuf,
     extra_args: Vec<String>,
     model_override: Option<String>,
+    approval_policy: Option<String>,
 }
 
 impl CodexAgent {
@@ -88,6 +92,7 @@ impl CodexAgent {
             binary: PathBuf::from(DEFAULT_BINARY),
             extra_args: Vec::new(),
             model_override: None,
+            approval_policy: None,
         }
     }
 
@@ -99,6 +104,7 @@ impl CodexAgent {
             binary: binary.into(),
             extra_args: Vec::new(),
             model_override: None,
+            approval_policy: None,
         }
     }
 
@@ -116,6 +122,13 @@ impl CodexAgent {
     /// every dispatch through that backend.
     pub fn with_model_override(mut self, model: impl Into<String>) -> Self {
         self.model_override = Some(model.into());
+        self
+    }
+
+    /// Override the Codex CLI approval policy with a value from
+    /// `[agent.codex] approval_policy`. Defaults to `never` for headless runs.
+    pub fn with_approval_policy(mut self, policy: impl Into<String>) -> Self {
+        self.approval_policy = Some(policy.into());
         self
     }
 
@@ -251,9 +264,13 @@ impl CodexAgent {
         if !req.env.is_empty() {
             cmd.envs(req.env.iter());
         }
+        let approval_policy = self
+            .approval_policy
+            .as_deref()
+            .unwrap_or(DEFAULT_APPROVAL_POLICY);
+        cmd.args(["--ask-for-approval", approval_policy]);
         cmd.arg("exec");
         cmd.args(["--json", "--skip-git-repo-check"]);
-        cmd.args(["--ask-for-approval", "never"]);
         let model = self.model_override.as_deref().unwrap_or(&req.model);
         cmd.args(["--model", model]);
         for arg in &self.extra_args {
@@ -608,7 +625,8 @@ mod tests {
     async fn build_command_includes_required_flags_and_workdir() {
         let agent = CodexAgent::with_binary("/usr/local/bin/codex")
             .with_extra_args(vec!["--quiet".into(), "--json-trace".into()])
-            .with_model_override("gpt-5-codex");
+            .with_model_override("gpt-5-codex")
+            .with_approval_policy("on-request");
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("run.log");
         let req = AgentRequest {
@@ -627,12 +645,20 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args.first().map(String::as_str), Some("exec"));
-        assert!(args.iter().any(|a| a == "--json"));
-        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
         assert!(args
             .windows(2)
-            .any(|w| w[0] == "--ask-for-approval" && w[1] == "never"));
+            .any(|w| w[0] == "--ask-for-approval" && w[1] == "on-request"));
+        let exec_pos = args.iter().position(|a| a == "exec").expect("exec arg");
+        let approval_pos = args
+            .iter()
+            .position(|a| a == "--ask-for-approval")
+            .expect("approval arg");
+        assert!(
+            approval_pos < exec_pos,
+            "approval policy must be a top-level codex flag: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--json"));
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
         assert!(args
             .windows(2)
             .any(|w| w[0] == "--model" && w[1] == "gpt-5-codex"));

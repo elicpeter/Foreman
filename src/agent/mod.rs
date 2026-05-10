@@ -243,6 +243,9 @@ pub fn build_agent(cfg: &crate::config::Config) -> Result<Box<dyn Agent + Send +
             if let Some(model) = overrides.model.as_deref() {
                 agent = agent.with_model_override(model);
             }
+            if let Some(policy) = overrides.approval_policy.as_deref() {
+                agent = agent.with_approval_policy(policy);
+            }
             Ok(Box::new(agent))
         }
         backend::BackendKind::Aider => {

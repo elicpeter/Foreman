@@ -271,7 +271,8 @@ pub struct TestsConfig {
 /// (today, Claude Code).
 ///
 /// The four sub-tables (`claude_code`, `codex`, `aider`, `gemini`) all share
-/// the same shape (`binary`, `extra_args`, `model`), and all four are active:
+/// the same base shape (`binary`, `extra_args`, `model`), plus backend-specific
+/// policy overrides, and all four are active:
 /// [`crate::agent::build_agent`] reads whichever sub-table matches the selected
 /// backend and forwards its overrides to the constructed agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +494,10 @@ pub struct BackendOverrides {
     /// Model identifier override. When set, this wins over [`ModelRoles`]
     /// for any role dispatched through this backend.
     pub model: Option<String>,
+    /// Codex approval policy for generated command execution. Only consumed by
+    /// the Codex adapter today; when unset, Codex runs with `never` so
+    /// non-interactive pitboss dispatches cannot block on prompts.
+    pub approval_policy: Option<String>,
     /// Pin the permission mode for every dispatch through this backend.
     /// Only consumed by the Claude Code adapter today (other backends ignore
     /// it). When `None`, the adapter picks per-model: `auto` for Opus,
@@ -825,6 +830,7 @@ permission_mode = \"bypassPermissions\"
 binary = \"/usr/local/bin/codex\"
 extra_args = [\"--quiet\"]
 model = \"gpt-5\"
+approval_policy = \"on-request\"
 
 [agent.aider]
 binary = \"/usr/local/bin/aider\"
@@ -860,6 +866,10 @@ model = \"gemini-2.5-pro\"
         );
         assert_eq!(cfg.agent.codex.extra_args, vec!["--quiet".to_string()]);
         assert_eq!(cfg.agent.codex.model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            cfg.agent.codex.approval_policy.as_deref(),
+            Some("on-request")
+        );
         assert_eq!(
             cfg.agent.aider.binary,
             Some(PathBuf::from("/usr/local/bin/aider"))

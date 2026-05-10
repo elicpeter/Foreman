@@ -399,7 +399,9 @@ Wraps OpenAI's `codex` CLI. The agent concatenates the system and user prompts, 
   backend = "codex"
 
   [agent.codex]
-  model = "gpt-5-codex"
+  model = "gpt-5.5"
+  approval_policy = "on-request"  # optional: untrusted, on-request, never
+  extra_args = ["-c", 'model_reasoning_effort="xhigh"']
   ```
 - **Limitations:** none known.
 

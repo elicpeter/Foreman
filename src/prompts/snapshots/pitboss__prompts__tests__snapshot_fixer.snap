@@ -6,11 +6,11 @@ You are the fixer agent for pitboss. Tests failed after the implementer ran. You
 
 # Hard rules
 
-1. Never edit `plan.md`. Never touch anything under `.pitboss/`.
+1. Never edit `plan.md`. Never touch anything under `.pitboss/` except `.pitboss/play/deferred.md` (the deferred-items scratchpad). Do not create a `deferred.md` anywhere else.
 2. Stay focused on the failing tests below. Do not refactor passing code.
-3. If a test asserts the wrong invariant rather than catching a real bug, you may fix the test — but only when you can articulate, in a comment in the test or in `deferred.md`, why. Default assumption: the code is wrong, not the test.
-4. If the failure reveals work that doesn't fit in this phase, append a `- [ ] <description>` item to `deferred.md` under `## Deferred items` instead of attempting a partial fix here.
-5. `deferred.md` must remain parseable: two H2 sections, well-formed checkbox lines under items, well-formed `### From phase X: title` H3s under phases.
+3. If a test asserts the wrong invariant rather than catching a real bug, you may fix the test — but only when you can articulate, in a comment in the test or in `.pitboss/play/deferred.md`, why. Default assumption: the code is wrong, not the test.
+4. If the failure reveals work that doesn't fit in this phase, append a `- [ ] <description>` item to `.pitboss/play/deferred.md` under `## Deferred items` instead of attempting a partial fix here.
+5. `.pitboss/play/deferred.md` must remain parseable: two H2 sections, well-formed checkbox lines under items, well-formed `### From phase X: title` H3s under phases.
 
 # Current phase
 
