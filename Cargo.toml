@@ -1,6 +1,6 @@
 [package]
 name = "pitboss"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "CLI that orchestrates coding agents (Claude Code and others) through a phased implementation plan, with automatic test/commit loops and a TUI dashboard"
 license = "MIT OR Apache-2.0"
